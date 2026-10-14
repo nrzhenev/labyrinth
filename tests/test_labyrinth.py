@@ -1,353 +1,442 @@
 import asyncio
+import ast
+import io
+import json
 import unittest
-from unittest.mock import Mock, patch
+from dataclasses import dataclass
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
 from xml.etree import ElementTree
 
-from labyrinth import Cell, CellState, Maze, Mouse
+from labyrinth import ClosedMaze, Direction, Grid, Mouse, Place, PlaceObject, SpiralMaze, TrailLine
 from labyrinth_view import MazeView
 from main import create_demo
 
+NS = {"s": "http://www.w3.org/2000/svg"}
 
-class MazeTests(unittest.TestCase):
-    def test_default_is_open_and_wrapped(self):
-        maze = Maze(3, 2)
-        self.assertEqual(maze.adjacent((0, 0), "left"), (2, 0))
-        self.assertEqual(maze.adjacent((0, 0), "up"), (0, 1))
-        self.assertTrue(maze.can_move((0, 0), "left"))
-        self.assertTrue(maze.can_move((0, 0), "up"))
-        closed = Maze(3, 2, mode="closed")
-        self.assertEqual(closed.neighbors((1, 0)), ())
 
-    def test_links_are_bidirectional_and_only_between_adjacent_cells(self):
-        maze = Maze(3, 3, mode="closed")
-        maze.connect((0, 0), (1, 0))
-        self.assertTrue(maze.can_move((1, 0), "left"))
-        maze.disconnect((1, 0), (0, 0))
-        self.assertFalse(maze.can_move((0, 0), "right"))
-        for a, b in [((0, 0), (1, 1)), ((0, 0), (0, 0)), ((0, 0), (-1, 0))]:
+class PlaceTests(unittest.TestCase):
+    def test_closed_is_cached_and_objects_removed_by_identity(self):
+        reads = []
+
+        class Block(PlaceObject):
+            def __getattribute__(self, name):
+                if name == "blocks_movement":
+                    reads.append(name)
+                return super().__getattribute__(name)
+
+        place = Place()
+        first = Block(blocks_movement=True)
+        second = Block(blocks_movement=True)
+        place.install(first).install(second)
+        for _ in range(10):
+            self.assertTrue(place.closed)
+        self.assertEqual(len(reads), 2)
+        place.remove(first)
+        self.assertTrue(place.closed)
+        self.assertIs(place.objects[0], second)
+        place.remove(second)
+        self.assertFalse(place.closed)
+        self.assertEqual(len(reads), 2)
+
+    def test_ttl_replacement_is_atomic_and_successor_gets_full_lifetime(self):
+        events = []
+        place = Place(lambda p: events.append((p.objects, p.closed)))
+        last = PlaceObject(ttl=1)
+        middle = PlaceObject(ttl=1, next_object=last, blocks_movement=True)
+        first = PlaceObject(ttl=1, next_object=middle, blocks_movement=True)
+        place.install(first)
+        place.tick()
+        self.assertEqual(place.objects, (middle,))
+        self.assertEqual(events[-1], ((middle,), True))
+        place.tick()
+        self.assertEqual(place.objects, (last,))
+        self.assertFalse(place.closed)
+        place.tick()
+        self.assertEqual(place.objects, ())
+        self.assertFalse(place.needs_tick)
+        self.assertEqual(len(events), 4)
+
+    def test_object_lifetime_belongs_to_each_installation(self):
+        first, second = Place(), Place()
+        shared = PlaceObject(ttl=2)
+        first.install(shared)
+        first.tick()
+        second.install(shared)
+        first.tick()
+        second.tick()
+        self.assertEqual(first.objects, ())
+        self.assertEqual(second.objects, (shared,))
+        second.tick()
+        self.assertEqual(second.objects, ())
+
+    def test_validation_and_identity(self):
+        for kwargs in ({"ttl": 0}, {"ttl": True}, {"layer": 4}, {"layer": True},
+                       {"next_object": PlaceObject()}):
             with self.assertRaises(ValueError):
-                maze.connect(a, b)
-
-    def test_invalid_path_does_not_partially_change_maze(self):
-        maze = Maze(3, 2, mode="closed")
+                PlaceObject(**kwargs)
+        place = Place()
+        for invalid in (object(), None):
+            with self.assertRaises(TypeError):
+                place.install(invalid)
+        obj = PlaceObject()
+        place.install(obj)
         with self.assertRaises(ValueError):
-            maze.open_path([(0, 0), (1, 0), (2, 1)])
-        self.assertEqual(maze.neighbors((0, 0)), ())
+            place.install(obj)
+        self.assertFalse(place.remove(PlaceObject()))
+        self.assertEqual(place.objects, (obj,))
 
-    def test_invalid_inputs(self):
+
+class GridTests(unittest.TestCase):
+    def test_shared_places_and_toroidal_geometry(self):
+        grid = Grid(3, 2)
+        self.assertEqual(grid.adjacent((0, 0), "left"), (2, 0))
+        self.assertIs(grid.root.left, grid.neighbor((0, 0), "left").right)
+        self.assertIs(grid.root.up, grid.neighbor((0, 0), "up").down)
+        self.assertEqual(repr(grid.root), "Cell(x=0, y=0)")
+        self.assertEqual(len(grid.links), 24)
+        self.assertEqual(len(grid.edge_places), 12)
+        self.assertFalse(hasattr(grid, "add_wall"))
+        with self.assertRaises(TypeError):
+            Grid(2, 2, mode="closed")
+
+    def test_parallel_edges_and_self_loops_are_distinct(self):
+        grid = Grid(2, 1)
+        self.assertIsNot(grid.root.right, grid.root.left)
+        self.assertIs(grid.root.right, grid.cell_at((1, 0)).left)
+        grid.place_between((0, 0), "right", PlaceObject(blocks_movement=True))
+        self.assertFalse(grid.can_move((0, 0), "right"))
+        self.assertTrue(grid.can_move((0, 0), "left"))
+        single = Grid(1, 1)
+        self.assertIs(single.root.left, single.root.right)
+        self.assertIs(single.root.up, single.root.down)
+        self.assertIsNot(single.root.left, single.root.up)
+        self.assertEqual(len(single.edge_places), 2)
+
+    def test_placement_queries_and_direct_place_notifications(self):
+        grid = Grid(3, 2)
+        observer = Mock()
+        grid.subscribe(observer)
+        item, block = PlaceObject(), PlaceObject(blocks_movement=True)
+        grid.place_on((0, 0), item).place_on((0, 0), block)
+        self.assertEqual(grid.objects_at((0, 0)), (item, block))
+        self.assertTrue(grid.can_move((0, 0), "right"))
+        grid.root.right.install(block)
+        self.assertEqual(grid.objects_between((1, 0), "left"), (block,))
+        self.assertFalse(grid.can_move((0, 0), "right"))
+        grid.remove_between((1, 0), "left", block)
+        grid.remove_from((0, 0), item)
+        self.assertEqual(grid.objects_at((0, 0)), (block,))
+        self.assertEqual(observer.call_count, 5)
+
+    def test_only_active_places_tick_once_and_notifications_are_batched(self):
+        grid = Grid(3, 1)
+        observer = Mock()
+        grid.subscribe(observer)
+        successor = PlaceObject(blocks_movement=False)
+        grid.place_between((0, 0), "right",
+                           PlaceObject(ttl=1, next_object=successor, blocks_movement=True))
+        grid.place_on((2, 0), PlaceObject(ttl=2))
+        observer.reset_mock()
+        with patch.object(grid.root.place, "tick") as idle_tick:
+            grid.tick()
+            idle_tick.assert_not_called()
+        observer.assert_called_once_with()
+        self.assertEqual(grid.objects_between((0, 0), "right"), (successor,))
+        self.assertTrue(grid.can_move((0, 0), "right"))
+        self.assertEqual(grid.active_places, frozenset({grid.cell_at((2, 0)).place}))
+        grid.tick()
+        self.assertEqual(grid.active_places, frozenset())
+        self.assertEqual(grid.current_tick, 2)
+
+    def test_invalid_dimensions_and_positions(self):
         for width, height in [(0, 2), (2, -1), (2.5, 2), (True, 2)]:
             with self.assertRaises(ValueError):
-                Maze(width, height)
-        with self.assertRaises(ValueError):
-            Maze(2, 2, entrance=(2, 0))
-        with self.assertRaises(ValueError):
-            Maze(2, 2, mode="unknown")
-
-    def test_directional_walls_reset_and_graph_snapshot(self):
-        maze = Maze(3, 2)
-        self.assertEqual(len(maze.cells), 2)
-        self.assertEqual(len(maze.cells[0]), 3)
-        self.assertIsInstance(maze.cells[1][2], Cell)
-        self.assertIs(maze.root, maze.cells[0][0])
-        self.assertEqual(repr(maze.root), "Cell(x=0, y=0)")
-        self.assertIs(Cell(0, 0, maze.root).up, maze.root)
-        self.assertIs(maze.root.left, maze.cells[0][2])
-        self.assertIs(maze.root.up, maze.cells[1][0])
-        self.assertEqual(len(maze.positions), 6)
-        self.assertEqual(len(maze.links), 24)
-        maze.add_wall((0, 0), "right")
-        self.assertTrue(maze.has_wall((1, 0), "left"))
-        self.assertIsNone(maze.cells[0][0].right)
-        self.assertIsNone(maze.cells[0][1].left)
-        maze.remove_wall((1, 0), "left")
-        self.assertFalse(maze.has_wall((0, 0), "right"))
-        maze.add_wall((0, 0), "up")
-        self.assertTrue(maze.has_wall((0, 1), "down"))
-        snapshot = maze.links
-        maze.reset(mode="closed")
-        self.assertEqual(maze.links, ())
-        self.assertEqual(len(snapshot), 22)
-        with self.assertRaises(ValueError):
-            maze.reset(mode="unknown")
-        self.assertEqual(maze.links, ())
-
-    def test_changing_endpoints_and_resetting_mouse(self):
-        maze = Maze(2, 2)
-        mouse = Mouse(maze)
-        maze.exit = (0, 0)
-        self.assertTrue(mouse.at_exit)
-        maze.entrance = (1, 1)
-        self.assertEqual(mouse.position, (0, 0))
-        mouse.reset()
-        self.assertEqual(mouse.position, (1, 1))
-        with self.assertRaises(ValueError):
-            maze.exit = (2, 2)
-        self.assertEqual(maze.exit, (0, 0))
-
-    def test_temporary_states_expire_and_reveal_previous_states(self):
-        maze = Maze(1, 1)
-        cell = maze.root
-        maze.set_base_state((0, 0), "grass")
-        maze.push_state((0, 0), "visited", ttl=5)
-        maze.tick().tick()
-        maze.push_state((0, 0), "danger", ttl=2)
-        self.assertEqual(cell.state, "danger")
-        self.assertEqual([item.value for item in cell.states], ["visited", "danger"])
-
-        maze.tick()
-        self.assertEqual(cell.state, "danger")
-        maze.tick()
-        self.assertEqual(cell.state, "visited")
-        maze.tick()
-        self.assertEqual(cell.state, "grass")
-
-    def test_hidden_expired_state_does_not_reappear(self):
-        maze = Maze(1, 1)
-        maze.push_state((0, 0), "short", ttl=1)
-        maze.push_state((0, 0), "long", ttl=3)
-        maze.tick()
-        self.assertEqual(maze.root.state, "long")
-        self.assertEqual([item.value for item in maze.root.states], ["long"])
-        maze.tick().tick()
-        self.assertEqual(maze.root.state, CellState.NORMAL)
-
-    def test_state_validation_and_clearing(self):
-        maze = Maze(2, 1)
-        for ttl in (0, -1, True, 1.5):
+                Grid(width, height)
+        for position in [(2, 0), (-1, 0), [0, 0], (True, 0)]:
             with self.assertRaises(ValueError):
-                maze.push_state((0, 0), "temporary", ttl)
+                Grid(2, 2, entrance=position)
+
+
+class ClosedMazeTests(unittest.TestCase):
+    def test_closed_maze_installs_one_wall_per_physical_edge(self):
+        for width, height in [(1, 1), (2, 1), (3, 2)]:
+            maze = ClosedMaze(width, height)
+            self.assertIsInstance(maze, Grid)
+            self.assertEqual(maze.links, ())
+            self.assertEqual(len(maze.placements), 2 * width * height)
+            self.assertTrue(all(place.closed for _, place in maze.edge_places))
+            self.assertEqual(maze.active_places, frozenset())
+
+    def test_wall_helpers_use_objects_and_preserve_other_blockers(self):
+        maze = ClosedMaze(3, 2)
+        other = PlaceObject(blocks_movement=True)
+        maze.place_between((0, 0), "right", other)
+        maze.remove_wall((0, 0), "right")
+        self.assertFalse(maze.has_wall((0, 0), "right"))
+        self.assertFalse(maze.can_move((0, 0), "right"))
+        maze.remove_between((0, 0), "right", other)
+        self.assertTrue(maze.can_move((0, 0), "right"))
+        maze.add_wall((0, 0), "right").add_wall((0, 0), "right")
+        self.assertEqual(len(maze.objects_between((1, 0), "left")), 1)
+
+    def test_path_is_validated_before_changes_and_notifies_once(self):
+        maze = ClosedMaze(3, 3)
+        observer = Mock()
+        maze.subscribe(observer)
         with self.assertRaises(ValueError):
-            maze.set_base_state((0, 0), "")
-        maze.push_state((0, 0), "first", 2)
-        maze.push_state((0, 0), "second", 2)
-        maze.push_state((1, 0), "second", 2)
-        maze.clear_states(state="second")
-        self.assertEqual(maze.cell_at((0, 0)).state, "first")
-        self.assertEqual(maze.cell_at((1, 0)).state, CellState.NORMAL)
-        maze.clear_states((0, 0))
-        self.assertEqual(maze.cell_at((0, 0)).state, CellState.NORMAL)
+            maze.open_path([(0, 0), (1, 0), (2, 1)])
+        self.assertEqual(maze.links, ())
+        observer.assert_not_called()
+        maze.open_path([(0, 0), (1, 0), (1, 1)])
+        observer.assert_called_once_with()
+        self.assertTrue(maze.is_connected((1, 1), (1, 0)))
+        maze.disconnect((1, 1), (1, 0))
+        self.assertFalse(maze.is_connected((1, 0), (1, 1)))
+
+
+class SpiralMazeTests(unittest.TestCase):
+    def test_clockwise_spiral_for_rectangle(self):
+        maze = SpiralMaze(4, 3)
+        self.assertIsInstance(maze, ClosedMaze)
+        self.assertEqual(maze.spiral_path, (
+            (0, 0), (1, 0), (2, 0), (3, 0), (3, 1), (3, 2),
+            (2, 2), (1, 2), (0, 2), (0, 1), (1, 1), (2, 1),
+        ))
+        self.assertEqual(maze.exit, (2, 1))
+
+    def test_spiral_visits_every_cell_and_mouse_reaches_end(self):
+        # Включает чётные/нечётные стороны, петли и параллельные рёбра тора.
+        for width in range(1, 8):
+            for height in range(1, 8):
+                with self.subTest(width=width, height=height):
+                    maze = SpiralMaze(width, height)
+                    path = maze.spiral_path
+                    self.assertEqual(len(path), width * height)
+                    self.assertEqual(set(path), set(maze.positions))
+                    self.assertEqual(maze.entrance, path[0])
+                    self.assertEqual(maze.exit, path[-1])
+                    self.assertEqual(len(maze.links), 2 * (width * height - 1))
+                    mouse = Mouse(maze)
+                    for start, end in zip(path, path[1:]):
+                        delta = (end[0] - start[0], end[1] - start[1])
+                        direction = next(d for d in Direction if d.delta == delta)
+                        self.assertEqual(mouse.move(direction), 1)
+                        self.assertEqual(mouse.position, end)
+                    self.assertTrue(mouse.at_exit)
+                    for x in range(width):
+                        self.assertTrue(maze.cell_at((x, 0)).up.closed)
+                        self.assertTrue(maze.cell_at((x, height - 1)).down.closed)
+                    for y in range(height):
+                        self.assertTrue(maze.cell_at((0, y)).left.closed)
+                        self.assertTrue(maze.cell_at((width - 1, y)).right.closed)
 
 
 class MouseTests(unittest.TestCase):
-    def test_stops_at_wall_without_crossing_it(self):
-        maze = Maze(4, 1, mode="closed")
+    def test_stops_at_closed_edge_and_only_successful_moves_tick(self):
+        maze = ClosedMaze(4, 1)
         maze.open_path([(0, 0), (1, 0), (2, 0)])
         mouse = Mouse(maze)
-        self.assertEqual(mouse.move("right", 10), 2)
+        self.assertEqual(mouse.right(10), 2)
         self.assertEqual(mouse.position, (2, 0))
-        self.assertEqual(mouse.move("down"), 0)
+        self.assertEqual(mouse.down(), 0)
+        self.assertEqual(maze.current_tick, 2)
         self.assertEqual(mouse.trail, ((0, 0), (1, 0), (2, 0)))
 
-    def test_absolute_movement_exit_and_reset(self):
-        maze = Maze(2, 2, entrance=(1, 0), exit=(0, 1))
-        mouse = Mouse(maze)
-        mouse.down()
-        mouse.left()
-        self.assertTrue(mouse.at_exit)
-        mouse.reset()
-        self.assertEqual(mouse.position, (1, 0))
-        self.assertEqual(mouse.trail, ((1, 0),))
-        self.assertFalse(mouse.at_exit)
-
-    def test_animation_stops_at_first_blocked_command(self):
-        maze = Maze(2, 2, mode="closed")
-        maze.connect((0, 0), (1, 0))
-        mouse = Mouse(maze)
-        moved = asyncio.run(mouse.walk(["right", "down", "left"], delay=0))
-        self.assertEqual(moved, 1)
-        self.assertEqual(mouse.position, (1, 0))
-
-    def test_single_cell_is_already_exit(self):
-        mouse = Mouse(Maze(1, 1))
-        self.assertTrue(mouse.at_exit)
-        self.assertEqual(mouse.right(), 1)
-        self.assertEqual(mouse.position, (0, 0))
-
-    def test_all_four_directions_without_turns(self):
-        mouse = Mouse(Maze(3, 3, entrance=(1, 1)))
-        for command, expected in [
-            (mouse.up, (1, 0)), (mouse.right, (2, 0)),
-            (mouse.down, (2, 1)), (mouse.left, (1, 1)),
-        ]:
-            self.assertEqual(command(), 1)
-            self.assertEqual(mouse.position, expected)
-        self.assertEqual(mouse.down(10), 10)
-        self.assertEqual(mouse.position, (1, 2))
-        self.assertTrue(mouse.can_move("down"))
-        self.assertTrue(mouse.can_move("up"))
-        self.assertEqual(mouse.up(2), 2)
-
-    def test_wraps_on_all_boundaries_and_respects_seam_wall(self):
-        maze = Maze(3, 3)
-        mouse = Mouse(maze)
-        mouse.left()
-        self.assertEqual(mouse.position, (2, 0))
-        mouse.up()
-        self.assertEqual(mouse.position, (2, 2))
+    def test_trail_is_three_successive_objects_with_ttl_one(self):
+        grid = Grid(5, 1)
+        mouse = Mouse(grid)
         mouse.right()
-        self.assertEqual(mouse.position, (0, 2))
-        mouse.down()
-        self.assertEqual(mouse.position, (0, 0))
-        maze.add_wall((0, 0), "left")
-        self.assertEqual(mouse.left(), 0)
-        self.assertTrue(maze.has_wall((2, 0), "right"))
-
-    def test_successful_moves_advance_time_and_leave_temporary_trail(self):
-        maze = Maze(5, 1)
-        mouse = Mouse(maze, trail_ttl=1)
-        maze.add_wall((0, 0), "down")
-        maze.push_state((4, 0), "signal", ttl=1)
-
-        self.assertEqual(mouse.down(), 0)
-        self.assertEqual(maze.current_tick, 0)
-        self.assertEqual(maze.cell_at((4, 0)).state, "signal")
-
-        self.assertEqual(mouse.right(), 1)
-        self.assertEqual(maze.current_tick, 1)
-        self.assertEqual(maze.cell_at((4, 0)).state, CellState.NORMAL)
-        self.assertEqual(maze.cell_at((0, 0)).state, CellState.TRAIL)
-        self.assertEqual(
-            [item.value for item in maze.cell_at((0, 0)).states],
-            [CellState.FADED_TRAIL, CellState.FADING_TRAIL, CellState.TRAIL],
-        )
+        place = grid.root.right
+        first = place.objects[0]
+        self.assertIsInstance(first, TrailLine)
+        self.assertEqual(first.layer, 3)
+        self.assertEqual(first.ttl, 1)
         mouse.right()
-        self.assertEqual(maze.cell_at((0, 0)).state, CellState.FADING_TRAIL)
+        self.assertIs(place.objects[0], first.next_object)
         mouse.right()
-        self.assertEqual(maze.cell_at((0, 0)).state, CellState.FADED_TRAIL)
+        self.assertIs(place.objects[0], first.next_object.next_object)
         mouse.right()
-        self.assertEqual(maze.cell_at((0, 0)).state, CellState.NORMAL)
-        self.assertEqual(maze.current_tick, 4)
+        self.assertEqual(place.objects, ())
 
-        manual_trail = (4, 0)
-        maze.push_state(manual_trail, CellState.TRAIL, ttl=10)
-        mouse.reset()
-        self.assertEqual(maze.cell_at(manual_trail).state, CellState.TRAIL)
-        self.assertTrue(all(
-            cell.state not in (
-                CellState.TRAIL, CellState.FADING_TRAIL, CellState.FADED_TRAIL,
-            )
-            for row in maze.cells
-            for cell in row
-            if cell.position != manual_trail
-        ))
-
-    def test_move_notifies_maze_and_mouse_listeners_once(self):
-        maze = Maze(2, 1)
-        mouse = Mouse(maze, trail_ttl=1)
-        maze_listener, mouse_listener = Mock(), Mock()
-        maze.subscribe(maze_listener)
-        mouse.subscribe(mouse_listener)
-        mouse.right()
-        maze_listener.assert_called_once_with()
-        mouse_listener.assert_called_once_with()
-
-    def test_reset_only_clears_trail_owned_by_that_mouse(self):
-        maze = Maze(3, 1)
-        first = Mouse(maze, trail_ttl=1)
-        second = Mouse(maze, trail_ttl=1)
+    def test_multiple_mice_and_generic_objects_survive_reset(self):
+        grid = Grid(3, 1)
+        first, second = Mouse(grid), Mouse(grid)
+        item = PlaceObject()
+        grid.root.right.install(item)
         first.right()
         second.right()
-        self.assertEqual(len(maze.cell_at((0, 0)).states), 5)
         first.reset()
-        self.assertEqual(len(maze.cell_at((0, 0)).states), 3)
-        self.assertEqual(maze.cell_at((0, 0)).state, CellState.TRAIL)
+        self.assertEqual(len(grid.root.right.objects), 2)
         second.reset()
-        self.assertEqual(maze.cell_at((0, 0)).state, CellState.NORMAL)
+        self.assertEqual(grid.root.right.objects, (item,))
+        self.assertEqual(second.trail, ((0, 0),))
 
-    def test_trail_ttl_validation(self):
-        for ttl in (0, -1, True, 1.5):
-            with self.assertRaises(ValueError):
-                Mouse(Maze(2, 2), trail_ttl=ttl)
+    def test_notifications_deduplicate_shared_callbacks(self):
+        grid = Grid(2, 1)
+        mouse = Mouse(grid)
+        shared, grid_only = Mock(), Mock()
+        grid.subscribe(shared)
+        mouse.subscribe(shared)
+        grid.subscribe(grid_only)
+        mouse.right()
+        shared.assert_called_once_with()
+        grid_only.assert_called_once_with()
+
+    def test_directions_wrap_and_endpoint_changes(self):
+        grid = Grid(3, 3, entrance=(1, 1))
+        mouse = Mouse(grid)
+        for command, position in [(mouse.up, (1, 0)), (mouse.right, (2, 0)),
+                                  (mouse.down, (2, 1)), (mouse.left, (1, 1))]:
+            command()
+            self.assertEqual(mouse.position, position)
+        mouse.down(10)
+        self.assertEqual(mouse.position, (1, 2))
+        grid.exit = mouse.position
+        self.assertTrue(mouse.at_exit)
+        grid.entrance = (0, 0)
+        mouse.reset()
+        self.assertEqual(mouse.position, (0, 0))
+        single = Mouse(Grid(1, 1))
+        self.assertEqual(single.right(), 1)
+        self.assertTrue(single.at_exit)
+
+    def test_async_walk_stops_at_first_blocked_command(self):
+        maze = ClosedMaze(2, 2)
+        maze.connect((0, 0), (1, 0))
+        mouse = Mouse(maze)
+        self.assertEqual(asyncio.run(mouse.walk(["right", "down", "left"], delay=0)), 1)
 
 
 class ViewTests(unittest.TestCase):
-    def test_open_maze_has_no_wall_strokes(self):
-        view = MazeView(Maze(3, 2))
-        self.addCleanup(view.close)
-        self.assertNotIn("#334155", view.to_svg())
+    def test_registry_layers_mro_and_unknown_objects(self):
+        @dataclass(frozen=True, slots=True, kw_only=True)
+        class Marker(PlaceObject):
+            name: str
 
-    def test_svg_and_programmatic_settings(self):
-        maze = Maze(2, 2, mode="closed")
-        view = MazeView(maze, show_trail=False, show_grid=False)
-        self.addCleanup(view.close)
-        root = ElementTree.fromstring(view.to_svg())
-        self.assertEqual(root.tag, "{http://www.w3.org/2000/svg}svg")
-        self.assertEqual(root.attrib["width"], "120")
-        self.assertFalse(view.show_grid)
-        self.assertFalse(view.show_trail)
-        maze.remove_wall((0, 0), "right")
-        view.mouse.right()
-        history = view.mouse.trail
-        svg_without_trail = view.to_svg()
-        view.show_trail = True
-        view.show_grid = True
-        view.redraw()
-        self.assertNotEqual(view.to_svg(), svg_without_trail)
-        self.assertEqual(view.mouse.trail, history)
-        view.close()
-        self.assertEqual(maze._listeners, [])
-        self.assertEqual(view.mouse._listeners, [])
+        class Child(Marker):
+            pass
 
-    def test_display_id_updates_existing_outputs(self):
-        maze = Maze(2, 2)
-        view = MazeView(maze)
+        grid = Grid(3, 2)
+        view = MazeView(grid)
         self.addCleanup(view.close)
-        first, second = Mock(), Mock()
-        with patch("labyrinth_view.display", side_effect=[first, second]) as output:
-            view._ipython_display_()
-            view._ipython_display_()
-        self.assertTrue(output.call_args.kwargs["display_id"])
-        previous = view.to_svg()
-        view.mouse.right()
-        self.assertNotEqual(previous, view.to_svg())
-        for handle in (first, second):
-            handle.update.assert_called_once()
-            self.assertEqual(handle.update.call_args.args[0].data, view.to_svg())
-        view.close()
-        view.mouse.reset()
-        first.update.assert_called_once()
+        calls = []
 
-    def test_cell_state_colors_and_hidden_temporary_trail(self):
-        maze = Maze(4, 1)
-        maze.set_base_state((1, 0), "mud")
-        mouse = Mouse(maze, trail_ttl=1)
-        view = MazeView(maze, mouse, state_colors={"mud": "#123456"})
-        self.addCleanup(view.close)
-        self.assertIn("#123456", view.to_svg())
+        def render(view, obj, location, context):
+            calls.append((obj.name, location, len(context.placements)))
+            return f'<g id="{obj.name}"/>'
 
-        mouse.right()
-        mouse.right()
-        mouse.right()
+        view.register_renderer(Marker, render)
+        grid.place_on((0, 0), Marker(name="front", layer=3))
+        grid.place_between((0, 0), "right", Child(name="back", layer=1))
+        grid.place_on((2, 1), Marker(name="middle", layer=2))
+        grid.place_on((0, 0), Marker(name="front-second", layer=3))
+        grid.place_on((0, 0), PlaceObject())
         svg = view.to_svg()
         ElementTree.fromstring(svg)
-        self.assertIn("<linearGradient", svg)
-        self.assertIn('gradientUnits="userSpaceOnUse"', svg)
-        self.assertIn('stop-color="#dbeafe"', svg)
-        self.assertNotIn('fill="#dbeafe"', svg)
-        self.assertNotIn("#123456", view.to_svg())
-        self.assertIn('stop-color="#bfdbfe"', svg)
-        self.assertNotIn('fill="#bfdbfe"', svg)
-        self.assertIn('stop-color="#93c5fd"', svg)
-        self.assertNotIn('fill="#93c5fd"', svg)
-        self.assertIn('stroke="url(#trail-gradient-0)"', svg)
-        view.show_trail = False
-        self.assertNotIn("#dbeafe", view.to_svg())
-        self.assertNotIn("#bfdbfe", view.to_svg())
-        self.assertNotIn("#93c5fd", view.to_svg())
-        self.assertIn("#123456", view.to_svg())
+        self.assertEqual([name for name, _, _ in calls],
+                         ["back", "middle", "front", "front-second"])
+        self.assertEqual(calls[0][1].direction, Direction.RIGHT)
+        self.assertEqual(calls[0][2], 5)
+        calls.clear()
+        view.register_renderer(Child, lambda *args: '<g id="child"/>')
+        self.assertIn('id="child"', view.to_svg())
+        self.assertNotIn("back", [name for name, _, _ in calls])
 
-    def test_demo_reaches_exit(self):
+    def test_gradient_line_is_layer_three_and_has_no_cell_fill(self):
+        grid = Grid(5, 1)
+        mouse = Mouse(grid)
+        view = MazeView(grid, mouse)
+        self.addCleanup(view.close)
+        mouse.right(3)
+        svg = view.to_svg()
+        root = ElementTree.fromstring(svg)
+        gradients = root.findall(".//s:linearGradient", NS)
+        self.assertEqual(len(gradients), 3)
+        stops = [[stop.attrib["stop-color"] for stop in gradient] for gradient in gradients]
+        self.assertEqual(stops, [["#dbeafe", "#bfdbfe"],
+                                 ["#bfdbfe", "#93c5fd"], ["#93c5fd", "#93c5fd"]])
+        self.assertNotIn('fill="#93c5fd"', svg)
+        view.show_trail = False
+        self.assertNotIn("linearGradient", view.to_svg())
+        self.assertEqual(len(grid.placements), 3)
+
+    def test_generic_closed_edge_and_seam_render_without_wall_knowledge(self):
+        grid = Grid(3, 2)
+        view = MazeView(grid, show_grid=False)
+        self.addCleanup(view.close)
+        self.assertNotIn("#334155", view.to_svg())
+        grid.place_between((0, 0), "left", PlaceObject(blocks_movement=True))
+        root = ElementTree.fromstring(view.to_svg())
+        barriers = [line for line in root.findall("s:line", NS)
+                    if line.attrib["stroke"] == "#334155"]
+        self.assertEqual(len(barriers), 2)
+        view.mouse.left()  # blocked, no trail
+        self.assertNotIn("linearGradient", view.to_svg())
+
+    def test_trail_on_toroidal_seam_is_split_into_two_half_segments(self):
+        grid = Grid(3, 1)
+        view = MazeView(grid)
+        self.addCleanup(view.close)
+        view.mouse.left()
+        root = ElementTree.fromstring(view.to_svg())
+        trail = [line for line in root.findall("s:polyline", NS)
+                 if line.attrib["stroke"].startswith("url(")]
+        self.assertEqual(len(trail), 2)
+        for line in trail:
+            points = [tuple(map(float, point.split(",")))
+                      for point in line.attrib["points"].split()]
+            self.assertEqual(abs(points[1][0] - points[0][0]), view.cell_size / 2)
+
+    def test_display_id_updates_once_and_unsubscribes(self):
+        grid = Grid(2, 2)
+        view = MazeView(grid)
+        self.addCleanup(view.close)
+        handle = Mock()
+        with patch("labyrinth_view.display", return_value=handle):
+            view._ipython_display_()
+        view.mouse.right()
+        handle.update.assert_called_once()
+        self.assertEqual(handle.update.call_args.args[0].data, view.to_svg())
+        view.close()
+        view.mouse.reset()
+        handle.update.assert_called_once()
+        self.assertEqual(grid._listeners, [])
+
+    def test_demo_reaches_exit_and_notebook_uses_new_api(self):
         maze, mouse, view = create_demo()
         self.addCleanup(view.close)
-        steps = asyncio.run(mouse.walk(
-            ["right", "right", "down", "left", "down", "right", "right", "right", "down"],
-            delay=0,
-        ))
-        self.assertEqual(steps, 9)
-        self.assertEqual(mouse.position, maze.exit)
+        self.assertIsInstance(maze, ClosedMaze)
+        route = ["right", "right", "down", "left", "down", "right", "right", "right", "down"]
+        self.assertEqual(asyncio.run(mouse.walk(route, delay=0)), 9)
         self.assertTrue(mouse.at_exit)
-        mouse.reset()
-        self.assertFalse(mouse.at_exit)
+        self.assertFalse(maze.can_move((0, 0), "up"))
+        notebook = json.loads((Path(__file__).resolve().parents[1] / "demo.ipynb").read_text())
+        sources = "".join("".join(cell["source"]) for cell in notebook["cells"])
+        self.assertNotIn("mode=", sources)
+        self.assertNotIn("trail_ttl", sources)
+        for cell in notebook["cells"]:
+            if cell["cell_type"] == "code" and not any("await " in line for line in cell["source"]):
+                compile("".join(cell["source"]), "demo.ipynb", "exec")
+
+    def test_notebook_cells_execute_with_new_api(self):
+        notebook = json.loads((Path(__file__).resolve().parents[1] / "demo.ipynb").read_text())
+        namespace = {}
+        with (patch("time.sleep"), patch("asyncio.sleep", new_callable=AsyncMock),
+              patch("IPython.display.display", return_value=None),
+              patch("sys.stdout", new_callable=io.StringIO)):
+            for cell in notebook["cells"]:
+                if cell["cell_type"] != "code":
+                    continue
+                code = compile("".join(cell["source"]), "demo.ipynb", "exec",
+                               flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                result = eval(code, namespace)
+                if asyncio.iscoroutine(result):
+                    asyncio.run(result)
+        self.addCleanup(namespace["view"].close)
+        self.addCleanup(namespace["my_view"].close)
+        self.assertTrue(namespace["mouse"].at_exit)
+        self.assertTrue(namespace["my_grid"].can_move((1, 0), "right"))
 
 
 if __name__ == "__main__":

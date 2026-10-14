@@ -1,37 +1,100 @@
 """SVG-представление через стандартный вывод Jupyter, без GUI-виджетов."""
 
-from collections.abc import Mapping
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from html import escape
+from uuid import uuid4
 
 from IPython.display import SVG, display
 
-from labyrinth import CellState, Maze, Mouse
+from labyrinth import Grid, Location, Mouse, ObjectPlacement, PlaceObject, TrailLine
+
+
+@dataclass(slots=True)
+class RenderContext:
+    placements: tuple[ObjectPlacement, ...]
+    prefix: str
+    trails: dict[tuple[int, int], TrailLine] = field(init=False)
+    _index: int = 0
+
+    def __post_init__(self):
+        self.trails = {(id(item.object.owner), item.object.sequence): item.object
+                       for item in self.placements if isinstance(item.object, TrailLine)}
+
+    def gradient_id(self) -> str:
+        self._index += 1
+        return f"{self.prefix}-trail-{self._index}"
+
+
+Renderer = Callable[["MazeView", PlaceObject, Location, RenderContext], str]
+
+
+def render_trail_line(view: "MazeView", obj: TrailLine,
+                      location: Location, context: RenderContext) -> str:
+    if not view.show_trail:
+        return ""
+    following = context.trails.get((id(obj.owner), obj.sequence + 1))
+    end_color = following.color if following is not None and following.start == obj.end else obj.color
+    start_color, end_color = escape(obj.color, quote=True), escape(end_color, quote=True)
+    start = view._center(obj.start)
+    end = view._center(obj.end)
+    dx, dy = obj.direction.delta
+    virtual_end = (start[0] + dx * view.cell_size, start[1] + dy * view.cell_size)
+
+    def segment(a, b, gradient_start, gradient_end):
+        gradient_id = context.gradient_id()
+        return (
+            f'<defs><linearGradient id="{gradient_id}" gradientUnits="userSpaceOnUse" '
+            f'x1="{gradient_start[0]}" y1="{gradient_start[1]}" '
+            f'x2="{gradient_end[0]}" y2="{gradient_end[1]}">'
+            f'<stop offset="0%" stop-color="{start_color}"/>'
+            f'<stop offset="100%" stop-color="{end_color}"/>'
+            '</linearGradient></defs>'
+            f'<polyline points="{a[0]},{a[1]} {b[0]},{b[1]}" fill="none" '
+            f'stroke="url(#{gradient_id})" stroke-width="3" '
+            'stroke-linecap="round" stroke-linejoin="round"/>'
+        )
+
+    if end == virtual_end:
+        return segment(start, end, start, end)
+    # На шве тора показываем половины перехода на двух противоположных краях.
+    border = ((start[0] + virtual_end[0]) / 2, (start[1] + virtual_end[1]) / 2)
+    shift = (end[0] - virtual_end[0], end[1] - virtual_end[1])
+    opposite = (border[0] + shift[0], border[1] + shift[1])
+    shifted_start = (start[0] + shift[0], start[1] + shift[1])
+    return (segment(start, border, start, virtual_end)
+            + segment(opposite, end, shifted_start, end))
 
 
 class MazeView:
     def __init__(
-        self, maze: Maze, mouse: Mouse | None = None, *,
+        self, grid: Grid, mouse: Mouse | None = None, *,
         cell_size: int = 48, show_trail: bool = True, show_grid: bool = True,
-        state_colors: Mapping[CellState | str, str] | None = None,
     ):
         if type(cell_size) is not int or cell_size < 24:
             raise ValueError("cell_size должен быть целым числом не меньше 24")
-        if mouse is not None and mouse.maze is not maze:
-            raise ValueError("Мышка должна принадлежать этому лабиринту")
-        self.maze = maze
-        self.mouse = mouse if mouse is not None else Mouse(maze)
+        if mouse is not None and mouse.grid is not grid:
+            raise ValueError("Мышка должна принадлежать этой сетке")
+        self.grid = grid
+        self.mouse = mouse if mouse is not None else Mouse(grid)
         self.cell_size = cell_size
         self.margin = 12
         self._show_trail = bool(show_trail)
         self._show_grid = bool(show_grid)
-        self.state_colors = {
-            CellState.TRAIL: "#93c5fd",
-            CellState.FADING_TRAIL: "#bfdbfe",
-            CellState.FADED_TRAIL: "#dbeafe",
-            **(state_colors or {}),
-        }
+        self._renderers: dict[type[PlaceObject], Renderer] = {TrailLine: render_trail_line}
+        self._svg_prefix = f"grid-{uuid4().hex}"
         self._handles = []
-        self._unsubscribers = [maze.subscribe(self.redraw), self.mouse.subscribe(self.redraw)]
+        self._unsubscribers = [grid.subscribe(self.redraw), self.mouse.subscribe(self.redraw)]
+
+    def register_renderer(self, object_type: type[PlaceObject], renderer: Renderer):
+        if not issubclass(object_type, PlaceObject) or not callable(renderer):
+            raise TypeError("Нужен тип PlaceObject и вызываемый renderer")
+        self._renderers[object_type] = renderer
+        self.redraw()
+
+    def _renderer(self, obj: PlaceObject) -> Renderer | None:
+        return next((self._renderers[cls] for cls in type(obj).__mro__
+                     if cls in self._renderers), None)
 
     @property
     def show_trail(self) -> bool:
@@ -57,7 +120,7 @@ class MazeView:
     def to_svg(self) -> str:
         """Снимок состояния в SVG, пригодный также для сохранения в файл."""
         s, m = self.cell_size, self.margin
-        width, height = self.maze.width * s + 2 * m, self.maze.height * s + 2 * m
+        width, height = self.grid.width * s + 2 * m, self.grid.height * s + 2 * m
         parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
                  f'height="{height}" viewBox="0 0 {width} {height}">',
                  '<rect width="100%" height="100%" fill="white"/>']
@@ -72,99 +135,49 @@ class MazeView:
                           f'stroke="{color}" stroke-width="{thickness}" '
                           'stroke-linecap="round" stroke-linejoin="round"/>')
 
-        def gradient_line(start, end, start_color, end_color, index):
-            x1, y1 = self._center(start)
-            x2, y2 = self._center(end)
-            gradient_id = f"trail-gradient-{index}"
-            parts.append(
-                f'<defs><linearGradient id="{gradient_id}" gradientUnits="userSpaceOnUse" '
-                f'x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}">'
-                f'<stop offset="0%" stop-color="{start_color}"/>'
-                f'<stop offset="100%" stop-color="{end_color}"/>'
-                '</linearGradient></defs>'
-            )
-            polyline([(x1, y1), (x2, y2)], f"url(#{gradient_id})", 3)
-
         def circle(point, radius, color):
             x, y = point
             parts.append(f'<circle cx="{x}" cy="{y}" r="{radius}" fill="{color}"/>')
 
-        trail_states = (
-            CellState.TRAIL,
-            CellState.FADING_TRAIL,
-            CellState.FADED_TRAIL,
-        )
-        for position in self.maze.positions:
-            cell = self.maze.cell_at(position)
-            state = cell.state
-            if state in trail_states and not self.show_trail:
-                state = next(
-                    (item.value for item in reversed(cell.states)
-                     if item.value not in trail_states),
-                    cell.base_state,
-                )
-            color = None if state in trail_states else self.state_colors.get(state)
-            if color is not None:
-                color = escape(color, quote=True)
-                parts.append(f'<rect x="{m + position[0] * s}" y="{m + position[1] * s}" '
-                             f'width="{s}" height="{s}" fill="{color}"/>')
-        for cell, color in ((self.maze.entrance, "#bbf7d0"), (self.maze.exit, "#fed7aa")):
+        placements = tuple(sorted(self.grid.placements,
+                                  key=lambda item: (item.object.layer, item.order)))
+        context = RenderContext(placements, self._svg_prefix)
+
+        def render_layer(layer):
+            for item in placements:
+                if item.object.layer == layer:
+                    renderer = self._renderer(item.object)
+                    if renderer is not None:
+                        parts.append(renderer(self, item.object, item.location, context))
+
+        for cell, color in ((self.grid.entrance, "#bbf7d0"), (self.grid.exit, "#fed7aa")):
             parts.append(f'<rect x="{m + cell[0] * s}" y="{m + cell[1] * s}" '
                          f'width="{s}" height="{s}" fill="{color}"/>')
+        render_layer(1)
         if self.show_grid:
-            for x in range(self.maze.width + 1):
-                line(m + x * s, m, m + x * s, m + self.maze.height * s, "#e2e8f0", 1)
-            for y in range(self.maze.height + 1):
-                line(m, m + y * s, m + self.maze.width * s, m + y * s, "#e2e8f0", 1)
-        for x, y in self.maze.positions:
-            if x + 1 < self.maze.width and self.maze.has_wall((x, y), "right"):
+            for x in range(self.grid.width + 1):
+                line(m + x * s, m, m + x * s, m + self.grid.height * s, "#e2e8f0", 1)
+            for y in range(self.grid.height + 1):
+                line(m, m + y * s, m + self.grid.width * s, m + y * s, "#e2e8f0", 1)
+        render_layer(2)
+        for x, y in self.grid.positions:
+            cell = self.grid.cell_at((x, y))
+            if x + 1 < self.grid.width and cell.right.closed:
                 line(m + (x + 1) * s, m + y * s, m + (x + 1) * s, m + (y + 1) * s)
-            if y + 1 < self.maze.height and self.maze.has_wall((x, y), "down"):
+            if y + 1 < self.grid.height and cell.down.closed:
                 line(m + x * s, m + (y + 1) * s, m + (x + 1) * s, m + (y + 1) * s)
             # Стена на шве тора отмечается с обеих противоположных сторон поля.
-            if x == 0 and self.maze.has_wall((x, y), "left"):
+            if x == 0 and cell.left.closed:
                 line(m, m + y * s, m, m + (y + 1) * s)
-            if x == self.maze.width - 1 and self.maze.has_wall((x, y), "right"):
-                line(m + self.maze.width * s, m + y * s,
-                     m + self.maze.width * s, m + (y + 1) * s)
-            if y == 0 and self.maze.has_wall((x, y), "up"):
+            if x == self.grid.width - 1 and cell.right.closed:
+                line(m + self.grid.width * s, m + y * s,
+                     m + self.grid.width * s, m + (y + 1) * s)
+            if y == 0 and cell.up.closed:
                 line(m + x * s, m, m + (x + 1) * s, m)
-            if y == self.maze.height - 1 and self.maze.has_wall((x, y), "down"):
-                line(m + x * s, m + self.maze.height * s,
-                     m + (x + 1) * s, m + self.maze.height * s)
-        if self.show_trail and self.mouse.trail_ttl is not None:
-            segments = []
-            seen = set()
-            for start, end in reversed(tuple(zip(self.mouse.trail, self.mouse.trail[1:]))):
-                if start in seen:
-                    continue
-                seen.add(start)
-                state = self.maze.cell_at(start).state
-                if state not in trail_states:
-                    continue
-                if abs(end[0] - start[0]) + abs(end[1] - start[1]) > 1:
-                    continue
-                segments.append((start, end, state))
-            for index, (start, end, state) in enumerate(reversed(segments)):
-                start_color = escape(self.state_colors[state], quote=True)
-                end_state = self.maze.cell_at(end).state
-                end_color = escape(
-                    self.state_colors.get(end_state, self.state_colors[state]),
-                    quote=True,
-                )
-                gradient_line(start, end, start_color, end_color, index)
-        elif self.show_trail and len(self.mouse.trail) > 1:
-            segment = [self.mouse.trail[0]]
-            for cell in self.mouse.trail[1:]:
-                previous = segment[-1]
-                if abs(cell[0] - previous[0]) + abs(cell[1] - previous[1]) > 1:
-                    if len(segment) > 1:
-                        polyline([self._center(item) for item in segment], "#93c5fd", 3)
-                    segment = [cell]
-                else:
-                    segment.append(cell)
-            if len(segment) > 1:
-                polyline([self._center(item) for item in segment], "#93c5fd", 3)
+            if y == self.grid.height - 1 and cell.down.closed:
+                line(m + x * s, m + self.grid.height * s,
+                     m + (x + 1) * s, m + self.grid.height * s)
+        render_layer(3)
 
         x, y = self._center(self.mouse.position)
         dx, dy = (1, 0)

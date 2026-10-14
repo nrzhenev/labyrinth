@@ -1,8 +1,8 @@
-# Лабиринт и мышка
+# Сетка, лабиринт и мышка
 
-Небольшой движок для Jupyter: построение лабиринта, SVG-отрисовка и управление
-мышкой из Python. Использует стандартный вывод `IPython.display`, без
-`ipywidgets` и `ipycanvas`. Вся работа с лабиринтом выполняется кодом.
+Небольшой Python-движок для Jupyter: тороидальная сетка, объекты на клетках и
+рёбрах, жизненные циклы через TTL и SVG-представление. Использует стандартный
+`IPython.display`, без GUI-виджетов.
 
 ## Запуск
 
@@ -13,201 +13,212 @@ uv sync
 uv run jupyter lab demo.ipynb
 ```
 
-Или без uv:
+Без uv: `python -m pip install ipython jupyterlab`, затем
+`python -m jupyter lab demo.ipynb`.
 
-```bash
-python -m pip install ipython jupyterlab
-python -m jupyter lab demo.ipynb
-```
-
-В Jupyter выберите ядро окружения с установленными зависимостями.
-Если Jupyter запущен отдельно, зарегистрируйте ядро проекта:
+Если Jupyter запущен отдельно, зарегистрируйте ядро:
 
 ```bash
 uv run python -m ipykernel install --user --name labyrinth --display-name "Python (labyrinth)"
 ```
 
-Затем выберите **Python (labyrinth)** в меню выбора ядра ноутбука.
-`main.py` содержит функцию `create_demo()`; отображение работает в Jupyter.
+## Grid и ClosedMaze
 
-## Клетки и связи
-
-Координаты — `(x, y)`, нумерация с нуля; `x` растёт вправо, `y` вниз.
-Каждая клетка — объект `Cell` со ссылками `up`, `right`, `down`, `left`.
-Все ссылки по умолчанию открыты. Поле закольцовано: верх соединён с низом,
-а левый край — с правым. Например, сосед `(0, 0)` слева на поле 4×3 — `(3, 0)`.
-Вход и выход — отмеченные клетки.
-
-Клетки доступны через двумерный список в порядке `[y][x]`:
+`Grid(width, height)` создаёт открытую закольцованную сетку. `ClosedMaze`
+наследует `Grid` и устанавливает стены на каждое ребро при инициализации.
+Параметра `mode` и класса `Maze` больше нет.
 
 ```python
-maze = Maze(4, 3)
-cell = maze.cells[1][2]
-print(cell.position)       # (2, 1)
-print(cell.right.position) # (3, 1)
-print(maze.root is maze.cells[0][0])  # True
-print(maze.root.left.position)         # (3, 0), переход через край
-```
-
-Мышка также хранит текущий объект в `mouse.cell` и при движении непосредственно
-переходит по одной из его ссылок.
-
-### Открывать проходы
-
-```python
-from IPython.display import display
-from labyrinth import Maze, Mouse
+from labyrinth import Grid, ClosedMaze, Mouse
 from labyrinth_view import MazeView
+from IPython.display import display
 
-maze = Maze(4, 3, mode="closed")  # Изначально все ссылки закрыты.
+maze = ClosedMaze(4, 3)
+maze.open_path([(0, 0), (1, 0), (1, 1), (2, 1), (3, 1), (3, 2)])
+mouse = Mouse(maze)
+view = MazeView(maze, mouse)
+display(view)
+```
+
+Координаты `(x, y)` начинаются с нуля. Клетки доступны как `grid.cells[y][x]`.
+`root` — клетка `(0, 0)`. Сетка закольцована: слева от `(0, 0)` находится
+`(width - 1, 0)`, а сверху — `(0, height - 1)`.
+
+```python
+grid = Grid(4, 3)
+cell = grid.cell_at((0, 0))
+neighbor = grid.neighbor((0, 0), "right")
+assert cell.right is neighbor.left
+print(grid.adjacent((0, 0), "left"))  # (3, 0)
+```
+
+`cell.left/right/up/down` — агрегаты `Place` между клетками, а не соседние
+клетки. `cell.place` хранит объекты непосредственно на клетке.
+
+Ребро задаётся клеткой и направлением. Это различает внутреннюю границу и шов
+тора даже при размере 2; при размере 1 горизонтальная и вертикальная петли
+также остаются разными `Place`.
+
+### Спиральный лабиринт
+
+`SpiralMaze` наследует `ClosedMaze` и открывает непрерывный путь по часовой
+стрелке от левого верхнего угла к центру. Каждая клетка посещается один раз;
+выход устанавливается в последнюю клетку пути. Поддерживаются любые
+положительные размеры, включая `1×1`, `1×N` и `N×1`. Швы тора остаются закрыты.
+
+```python
+from labyrinth import SpiralMaze
+
+maze = SpiralMaze(8, 5)
+mouse = Mouse(maze)
+view = MazeView(maze, mouse)
+display(view)
+print(maze.spiral_path)  # неизменяемый кортеж координат маршрута
+print(maze.exit)
+```
+
+## Place и объекты
+
+`Place` — корень агрегата. Объекты неизменяемые: для изменения удалите старый и
+установите новый. Количество блокирующих объектов кэшируется; чтение
+`place.closed` работает за O(1).
+
+```python
+from labyrinth import PlaceObject
+
+item = PlaceObject(layer=2)
+grid.place_on((1, 1), item)
+print(grid.objects_at((1, 1)))
+grid.remove_from((1, 1), item)
+
+door = PlaceObject(layer=3, blocks_movement=True)
+grid.place_between((0, 0), "right", door)
+assert grid.root.right.closed
+assert not grid.can_move((0, 0), "right")
+grid.remove_between((1, 0), "left", door)  # тот же Place с другой стороны
+```
+
+Прямые `cell.place.install(obj)` и `cell.right.remove(obj)` тоже уведомляют
+сетку. `place.objects` возвращает кортеж. Удаление выполняется по идентичности
+объекта, а не по равенству. Один экземпляр не устанавливается в один Place
+дважды; разные Place могут независимо хранить его со своими таймерами.
+
+Объекты непосредственно на клетке не запрещают вход в неё. Движение проверяет
+только `closed` соответствующего ребра. `grid.neighbors(position)` и
+`grid.links` возвращают проходимые переходы.
+
+Только `ClosedMaze` знает стены. Его `add_wall()`, `remove_wall()`, `has_wall()`,
+`connect()`, `disconnect()` и `open_path()` реализованы через установку/удаление
+объектов. Удаление стены сохраняет остальные объекты ребра: если дверь тоже
+блокирует движение, проход останется закрытым.
+
+```python
+maze.remove_wall((0, 0), "left")
+maze.add_wall((1, 1), "down")
 maze.connect((0, 0), (1, 0))
-maze.open_path([(1, 0), (1, 1), (2, 1), (3, 1), (3, 2)])
-mouse = Mouse(maze)
-view = MazeView(maze, mouse, cell_size=48)
-display(view)
 ```
 
-### Ставить стены
+Для неоднозначных пар соседей на торе используйте направление. `connect()` и
+`open_path()` предпочитают обычное направление по разности координат.
+
+## TTL и замена объекта
+
+`PlaceObject` имеет свойства `layer`, `blocks_movement`, `ttl` и `next_object`.
+`ttl=None` означает постоянный объект. При истечении TTL агрегат атомарно
+заменяет объект на `next_object` или удаляет его, если преемника нет.
 
 ```python
-maze = Maze(4, 3, entrance=(0, 0), exit=(3, 2))  # По умолчанию стен нет.
-maze.disconnect((0, 0), (1, 0))  # Закрыть проход.
-maze.connect((0, 0), (1, 0))     # Снова открыть.
-
-# То же самое через сторону клетки:
-maze.add_wall((0, 0), "right")
-maze.remove_wall((0, 0), "right")
-print(maze.has_wall((0, 0), "right"))
-
-# Стены удобно задавать циклом:
-for y in range(maze.height - 1):
-    maze.add_wall((1, y), "right")
+open_door = PlaceObject(layer=3)
+closed_door = PlaceObject(layer=3, blocks_movement=True, ttl=2,
+                          next_object=open_door)
+grid.place_between((0, 0), "right", closed_door)
+grid.tick()
+assert grid.root.right.closed
+grid.tick()
+assert not grid.root.right.closed
 ```
 
-`maze.neighbors((x, y))` возвращает доступных соседей;
-`maze.is_connected(a, b)` проверяет проход между двумя соседними клетками.
-Изменения модели автоматически отображаются в выводе Jupyter.
+Остаток TTL хранится в записи `Place`, не в объекте. Преемник начинает свой
+полный срок с момента замены и не стареет на том же тике. Временные объекты
+стареют независимо от слоя и видимости.
 
-Дополнительные операции:
+`Grid.tick()` вызывает `Place.tick()` только для активных мест с TTL. Общие
+рёбра обрабатываются один раз, а все изменения тика дают одно уведомление.
+`grid.active_places` — неизменяемый снимок активных агрегатов.
+
+## Мышь и след
 
 ```python
-maze.entrance = (0, 1)
-maze.exit = (3, 2)
-mouse = Mouse(maze)
-maze.reset(mode="open")       # Открыть все связи, включая переходы через края.
-maze.reset(mode="closed")     # Закрыть все связи.
-print(maze.cells[1][2])       # Объект клетки в строке 1, столбце 2.
-print(maze.positions)         # Координаты всех клеток.
-print(maze.links)             # Направленные ссылки: откуда, направление, куда.
-print(maze.adjacent((0, 0), "right"))  # Геометрический сосед, даже за стеной.
-print(maze.adjacent((0, 0), "left"))   # (3, 0), закольцованный сосед.
+mouse.right(2)
+mouse.down()
+print(mouse.position, mouse.at_exit)
+await mouse.walk(["right", "down", "right"], delay=0.25)
 ```
 
-Смена входа не перемещает существующую мышку; вызовите `mouse.reset()`.
-Сброс лабиринта меняет только связи. Стену на шве можно поставить обычной командой:
-`maze.add_wall((0, 0), "left")`; она также закроет `right` у клетки `(3, 0)`.
+`up/down/left/right` и `move(direction, steps)` возвращают число сделанных
+шагов. Каждый успешный шаг создаёт один тик; попытка пройти через закрытое
+ребро время не расходует. `walk()` останавливается на первой заблокированной
+команде. В Jupyter можно использовать `await` прямо в ячейке.
 
-## Состояния клеток и тики
+На пройденном ребре мышь устанавливает `TrailLine` на слое 3 с цепочкой:
 
-У клетки есть постоянное `base_state` и стек временных состояний. Текущее
-эффективное состояние доступно через `cell.state`, а неизменяемый снимок стека —
-через `cell.states`. Последнее добавленное состояние перекрывает предыдущие.
+```text
+яркий (TTL 1) → промежуточный (TTL 1) → блеклый (TTL 1) → удаление
+```
+
+Каждая стадия — отдельный объект. Линия тонкая и имеет градиент между цветами
+соседних сегментов. Переход через край показывается двумя половинами на
+противоположных границах. `mouse.trail` остаётся полной историей посещений.
+`mouse.reset()` возвращает мышь на вход и удаляет только её объекты следа.
+
+`grid.entrance` и `grid.exit` можно изменять; смена входа не перемещает мышь.
+Старый механизм `CellState` удалён: любое состояние теперь объект в `Place`.
+
+## Реестр рендереров и слои
+
+Модель не знает SVG. Каждый экземпляр `MazeView` имеет собственный реестр.
+Объекты рисуются по `layer` от 1 до 3, внутри слоя — по порядку установки.
+Замена через TTL сохраняет позицию в этом порядке. Неизвестные типы
+пропускаются; для наследников выбирается ближайший зарегистрированный тип по
+MRO. Закрытые рёбра рисуются по `Place.closed`, без проверки типа стены.
 
 ```python
-maze.set_base_state((1, 1), "grass")
-maze.push_state((1, 1), "visited", ttl=5)
-maze.push_state((1, 1), "danger", ttl=2)
+from dataclasses import dataclass
+from html import escape
 
-print(maze.cell_at((1, 1)).state)  # danger
-maze.tick()
-maze.tick()
-print(maze.cell_at((1, 1)).state)  # visited
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Tile(PlaceObject):
+    layer: int = 1
+    color: str = "#dcfce7"
+
+def render_tile(view, obj, location, context):
+    x, y = location.position
+    s, m = view.cell_size, view.margin
+    return (f'<rect x="{m + x * s}" y="{m + y * s}" '
+            f'width="{s}" height="{s}" fill="{escape(obj.color, quote=True)}"/>')
+
+view.register_renderer(Tile, render_tile)
+view.grid.place_on((1, 1), Tile())
 ```
 
-TTL отсчитывается от момента добавления. Скрытые состояния также продолжают
-стареть и после истечения не появляются снова. `ttl=1` означает, что состояние
-будет удалено на следующем тике. Вызов `maze.clear_states(position)` очищает
-временные состояния одной клетки, а `maze.clear_states()` — всего поля.
-
-Каждый успешный шаг мышки автоматически создаёт один тик. Попытка пройти сквозь
-стену время не меняет. Для затухающего следа задайте длительность яркой фазы:
+Renderer возвращает SVG-строку. `location.direction=None` означает клетку,
+иначе — каноническое ребро. `context.placements` содержит снимок всех объектов
+кадра; встроенный renderer линии использует его для поиска следующего сегмента.
 
 ```python
-mouse = Mouse(maze, trail_ttl=1)
+view.show_trail = False   # скрыть линии без удаления объектов
+view.show_grid = False    # скрыть тонкую сетку, закрытые границы остаются
+view.redraw()
+svg = view.to_svg()
+view.close()              # отключить подписки
 ```
 
-`mouse.trail` при этом остаётся полной историей посещённых клеток. Временные
-состояния `trail` и `faded_trail` отвечают только за отображение и удаляются при
-`mouse.reset()`. TTL яркого состояния равен 1, промежуточного `fading_trail` — 2,
-а блеклого `faded_trail` — 3. Поскольку состояния создаются одновременно, след
-последовательно проходит три оттенка, каждый длиной в один сегмент. Все фазы
-рисуются тонкой линией с плавным градиентом между соседними оттенками, не
-закрашивая фон клеток. Если `trail_ttl` не задан, представление продолжает
-рисовать линию по полной истории.
+`display_id` обновляет уже показанный вывод, включая изменения из других ячеек.
+Модель в `labyrinth.py` независима от Jupyter; представление — в
+`labyrinth_view.py`; `main.py` содержит `create_demo()`.
 
-Для пользовательских состояний цвета передаются представлению отдельно, чтобы
-модель не зависела от SVG:
+## Проверки
 
-```python
-view = MazeView(maze, mouse, state_colors={
-    "grass": "#dcfce7",
-    "visited": "#bfdbfe",
-    "danger": "#fecaca",
-})
+```bash
+uv run python -m unittest discover -s tests
 ```
-
-## Команды мышки
-
-| Команда | Действие |
-| --- | --- |
-| `mouse.up()` / `mouse.down()` | Один шаг вверх / вниз |
-| `mouse.right(2)` / `mouse.left(2)` | До двух шагов вправо / влево |
-| `mouse.move("right", 2)` | До двух шагов вправо; возвращает число сделанных шагов |
-| `mouse.move("up")` | Один шаг вверх (также есть `down` и `left`) |
-| `mouse.can_move("down")` | Можно ли идти в указанном направлении |
-| `mouse.position` | Текущая клетка |
-| `mouse.at_exit` | Находится ли мышка на выходе |
-| `mouse.trail` | История посещённых клеток |
-| `mouse.reset()` | Вернуться на вход и сбросить след |
-
-Движение всегда задаётся относительно поля: `up`, `down`, `right`, `left`.
-Каждая команда сразу перемещает мышку; предварительные повороты не нужны.
-Стены непроходимы: мышка останавливается, исключение не возникает. Если стены нет,
-переход через любую границу переносит мышку на противоположную сторону.
-Все команды движения возвращают число фактически сделанных шагов.
-Достижение выхода проверяется через `mouse.at_exit`; дальнейшие команды доступны.
-
-Обычные команды выполняются сразу. Для анимации используйте **`await`**:
-
-```python
-mouse.reset()
-await mouse.walk(["right", "down", "right", "right", "down"], delay=0.25)
-print(mouse.at_exit)
-```
-
-Каждый элемент — один шаг, `delay` — пауза в секундах. При столкновении
-со стеной выполнение маршрута прекращается. `walk` возвращает число шагов.
-В Jupyter не требуется `asyncio.run()`; `await` можно писать прямо в ячейке.
-
-## Отрисовка из кода
-
-Зелёная клетка — вход, оранжевая — выход; нос мышки показывает последний
-успешный шаг исключительно для наглядности и не влияет на движение.
-Представление выводится как SVG. `display_id` позволяет обновлять существующее
-изображение, в том числе из других ячеек, без добавления новых картинок на каждый шаг.
-
-```python
-view = MazeView(maze, mouse, cell_size=56, show_trail=True, show_grid=True)
-display(view)
-view.show_trail = False  # Скрыть след, сохранив историю mouse.trail.
-view.show_grid = False   # Скрыть тонкую сетку; стены остаются видимыми.
-view.redraw()            # Явная перерисовка при необходимости.
-```
-
-Вместо `display(view)` можно написать `view` последней строкой ячейки.
-При изменении стен, входа, выхода и состояния мышки изображение обновляется автоматически.
-`view.close()` отключает подписки представления на модель.
-`view.to_svg()` возвращает текущее изображение строкой для сохранения в файл.
-
-Модель в `labyrinth.py` независима от Jupyter. Отрисовка — в `labyrinth_view.py`.
-Проверки модели и представления: `uv run python -m unittest discover -s tests`.

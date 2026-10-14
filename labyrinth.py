@@ -1,25 +1,14 @@
-"""Закольцованный клеточный лабиринт. Координаты: (столбец, строка)."""
+"""Закольцованная сетка объектов. Координаты: (столбец, строка)."""
 
 import asyncio
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import count
 
 Position = tuple[int, int]
-
-
-class CellState(str, Enum):
-    NORMAL = "normal"
-    TRAIL = "trail"
-    FADING_TRAIL = "fading_trail"
-    FADED_TRAIL = "faded_trail"
-
-
-@dataclass(frozen=True, slots=True)
-class TimedCellState:
-    value: CellState | str
-    expires_at: int
-    owner: object | None = field(default=None, repr=False, compare=False)
+_orders = count()
 
 
 class Direction(str, Enum):
@@ -30,55 +19,178 @@ class Direction(str, Enum):
 
     @property
     def delta(self) -> Position:
-        return {
-            Direction.UP: (0, -1),
-            Direction.RIGHT: (1, 0),
-            Direction.DOWN: (0, 1),
-            Direction.LEFT: (-1, 0),
-        }[self]
+        return {self.UP: (0, -1), self.RIGHT: (1, 0),
+                self.DOWN: (0, 1), self.LEFT: (-1, 0)}[self]
 
     @property
     def opposite(self) -> "Direction":
-        return {
-            Direction.UP: Direction.DOWN,
-            Direction.RIGHT: Direction.LEFT,
-            Direction.DOWN: Direction.UP,
-            Direction.LEFT: Direction.RIGHT,
-        }[self]
+        return {self.UP: self.DOWN, self.RIGHT: self.LEFT,
+                self.DOWN: self.UP, self.LEFT: self.RIGHT}[self]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PlaceObject:
+    """Неизменяемое описание объекта; таймер установки принадлежит Place."""
+
+    layer: int = 2
+    blocks_movement: bool = False
+    ttl: int | None = None
+    next_object: "PlaceObject | None" = None
+
+    def __post_init__(self):
+        if type(self.layer) is not int or self.layer not in (1, 2, 3):
+            raise ValueError("layer должен быть 1, 2 или 3")
+        if self.ttl is not None and (type(self.ttl) is not int or self.ttl < 1):
+            raise ValueError("ttl должен быть положительным целым числом или None")
+        if self.next_object is not None:
+            if not isinstance(self.next_object, PlaceObject) or self.ttl is None:
+                raise ValueError("next_object требует TTL и должен быть PlaceObject")
+
+
+@dataclass(slots=True)
+class _PlaceEntry:
+    object: PlaceObject
+    remaining_ttl: int | None
+    blocking: bool
+    order: int
+
+
+class Place:
+    """Корень агрегата: установка, удаление, таймеры и кэш закрытости."""
+
+    def __init__(self, on_change: Callable[["Place"], None] | None = None):
+        self._entries: list[_PlaceEntry] = []
+        self._blocking_count = 0
+        self._timed_count = 0
+        self._on_change = on_change
+
+    @property
+    def objects(self) -> tuple[PlaceObject, ...]:
+        return tuple(entry.object for entry in self._entries)
+
+    @property
+    def closed(self) -> bool:
+        return self._blocking_count > 0
+
+    @property
+    def needs_tick(self) -> bool:
+        return self._timed_count > 0
+
+    def _changed(self):
+        if self._on_change is not None:
+            self._on_change(self)
+
+    @staticmethod
+    def _validate(obj: PlaceObject):
+        if not isinstance(obj, PlaceObject):
+            raise TypeError("Устанавливать можно только PlaceObject")
+        seen = set()
+        while obj is not None:
+            if not isinstance(obj, PlaceObject):
+                raise TypeError("Устанавливать можно только PlaceObject")
+            if id(obj) in seen:
+                raise ValueError("Цепочка next_object не должна содержать циклы")
+            seen.add(id(obj))
+            obj = obj.next_object
+
+    def _entry(self, obj: PlaceObject, order: int) -> _PlaceEntry:
+        entry = _PlaceEntry(obj, obj.ttl, bool(obj.blocks_movement), order)
+        self._blocking_count += entry.blocking
+        self._timed_count += entry.remaining_ttl is not None
+        return entry
+
+    def _discard(self, entry: _PlaceEntry):
+        self._blocking_count -= entry.blocking
+        self._timed_count -= entry.remaining_ttl is not None
+
+    def install(self, obj: PlaceObject) -> "Place":
+        self._validate(obj)
+        if any(entry.object is obj for entry in self._entries):
+            raise ValueError("Объект уже установлен в этом Place")
+        self._entries.append(self._entry(obj, next(_orders)))
+        self._changed()
+        return self
+
+    def remove(self, obj: PlaceObject) -> bool:
+        return bool(self.remove_where(lambda item: item is obj))
+
+    def remove_where(self, predicate: Callable[[PlaceObject], bool]) -> int:
+        removed = [entry for entry in self._entries if predicate(entry.object)]
+        if not removed:
+            return 0
+        removed_ids = {id(entry) for entry in removed}
+        self._entries[:] = [entry for entry in self._entries if id(entry) not in removed_ids]
+        for entry in removed:
+            self._discard(entry)
+        self._changed()
+        return len(removed)
+
+    def tick(self):
+        """Преемник начинает жить сейчас, но не стареет на этом же тике."""
+        if not self.needs_tick:
+            return
+        entries = []
+        for entry in self._entries:
+            if entry.remaining_ttl is not None:
+                entry.remaining_ttl -= 1
+                if entry.remaining_ttl == 0:
+                    self._discard(entry)
+                    successor = entry.object.next_object
+                    if successor is not None:
+                        entries.append(self._entry(successor, entry.order))
+                    continue
+            entries.append(entry)
+        self._entries = entries
+        self._changed()
 
 
 @dataclass(eq=False, slots=True)
 class Cell:
-    """Узел графа с четырьмя ссылками на соседние клетки.
-
-    Отсутствующая ссылка (`None`) означает стену с этой стороны.
-    """
-
     x: int
     y: int
-    up: "Cell | None" = field(default=None, repr=False)
-    right: "Cell | None" = field(default=None, repr=False)
-    down: "Cell | None" = field(default=None, repr=False)
-    left: "Cell | None" = field(default=None, repr=False)
-    base_state: CellState | str = field(default=CellState.NORMAL, repr=False)
-    _states: list[TimedCellState] = field(default_factory=list, repr=False)
+    _place: Place = field(default_factory=Place, repr=False)
+    _sides: dict[Direction, Place] = field(default_factory=dict, repr=False)
 
     @property
     def position(self) -> Position:
         return self.x, self.y
 
     @property
-    def state(self) -> CellState | str:
-        """Последнее временное состояние или постоянное базовое состояние."""
-        return self._states[-1].value if self._states else self.base_state
+    def place(self) -> Place:
+        return self._place
+
+    def side(self, direction: Direction | str) -> Place:
+        return self._sides[Direction(direction)]
 
     @property
-    def states(self) -> tuple[TimedCellState, ...]:
-        """Неизменяемый снимок временных состояний от старых к новым."""
-        return tuple(self._states)
+    def left(self) -> Place:
+        return self.side(Direction.LEFT)
 
-    def neighbor(self, direction: Direction | str) -> "Cell | None":
-        return getattr(self, Direction(direction).value)
+    @property
+    def right(self) -> Place:
+        return self.side(Direction.RIGHT)
+
+    @property
+    def up(self) -> Place:
+        return self.side(Direction.UP)
+
+    @property
+    def down(self) -> Place:
+        return self.side(Direction.DOWN)
+
+
+@dataclass(frozen=True, slots=True)
+class Location:
+    position: Position
+    direction: Direction | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectPlacement:
+    object: PlaceObject
+    place: Place
+    location: Location
+    order: int
 
 
 class Observable:
@@ -108,33 +220,32 @@ class Observable:
             callback()
 
 
-class Maze(Observable):
-    """Двумерный список связанных клеток с закольцованными краями.
+class Grid(Observable):
+    """Открытая тороидальная геометрия с Place на клетках и рёбрах."""
 
-    `cells[y][x]` возвращает объект клетки, `root` указывает на `cells[0][0]`.
-    По умолчанию все четыре ссылки каждой клетки открыты, включая переходы
-    через края поля. Стена представлена отсутствующей парой обратных ссылок.
-    """
-
-    def __init__(
-        self,
-        width: int,
-        height: int,
-        *,
-        mode: str = "open",
-        entrance: Position = (0, 0),
-        exit: Position | None = None,
-    ):
+    def __init__(self, width: int, height: int, *, entrance: Position = (0, 0),
+                 exit: Position | None = None):
         super().__init__()
         if type(width) is not int or type(height) is not int or min(width, height) < 1:
             raise ValueError("Размеры должны быть положительными целыми числами")
         self._width, self._height = width, height
         self._tick = 0
-        self.cells = [[Cell(x, y) for x in range(width)] for y in range(height)]
+        self._active_places: set[Place] = set()
+        self._batch_depth = 0
+        self._pending_notify = False
+        self.cells = [[Cell(x, y, Place(self._place_changed)) for x in range(width)]
+                      for y in range(height)]
         self.root = self.cells[0][0]
         self._entrance = self.validate_position(entrance)
         self._exit = self.validate_position(exit if exit is not None else (width - 1, height - 1))
-        self.reset(mode=mode)
+        self._edges: list[tuple[Location, Place]] = []
+        for row in self.cells:
+            for cell in row:
+                for direction in (Direction.RIGHT, Direction.DOWN):
+                    place = Place(self._place_changed)
+                    cell._sides[direction] = place
+                    self.neighbor(cell.position, direction)._sides[direction.opposite] = place
+                    self._edges.append((Location(cell.position, direction), place))
 
     @property
     def width(self) -> int:
@@ -149,19 +260,31 @@ class Maze(Observable):
         return self._tick
 
     @property
+    def active_places(self) -> frozenset[Place]:
+        return frozenset(self._active_places)
+
+    @property
     def positions(self) -> tuple[Position, ...]:
         return tuple(cell.position for row in self.cells for cell in row)
 
     @property
+    def edge_places(self) -> tuple[tuple[Location, Place], ...]:
+        """Каждое физическое ребро ровно один раз, включая швы и петли."""
+        return tuple(self._edges)
+
+    @property
+    def placements(self) -> tuple[ObjectPlacement, ...]:
+        places = [(Location(cell.position), cell.place)
+                  for row in self.cells for cell in row]
+        places.extend(self._edges)
+        return tuple(ObjectPlacement(entry.object, place, location, entry.order)
+                     for location, place in places for entry in place._entries)
+
+    @property
     def links(self) -> tuple[tuple[Position, str, Position], ...]:
-        """Все направленные ссылки как `(откуда, направление, куда)`."""
-        return tuple(
-            (cell.position, direction.value, neighbor.position)
-            for row in self.cells
-            for cell in row
-            for direction in Direction
-            if (neighbor := cell.neighbor(direction)) is not None
-        )
+        return tuple((position, direction.value, self.adjacent(position, direction))
+                     for position in self.positions for direction in Direction
+                     if self.can_move(position, direction))
 
     @property
     def entrance(self) -> Position:
@@ -182,112 +305,119 @@ class Maze(Observable):
         self._notify()
 
     def validate_position(self, position: Position) -> Position:
-        if (
-            not isinstance(position, tuple)
-            or len(position) != 2
+        if (not isinstance(position, tuple) or len(position) != 2
             or any(type(value) is not int for value in position)
-            or not (0 <= position[0] < self.width and 0 <= position[1] < self.height)
-        ):
-            raise ValueError(f"Клетка вне лабиринта или некорректна: {position!r}")
+            or not (0 <= position[0] < self.width and 0 <= position[1] < self.height)):
+            raise ValueError(f"Клетка вне сетки или некорректна: {position!r}")
         return position
 
     def cell_at(self, position: Position) -> Cell:
         x, y = self.validate_position(position)
         return self.cells[y][x]
 
-    @staticmethod
-    def _validate_state(state: CellState | str) -> CellState | str:
-        if not isinstance(state, str) or not state:
-            raise ValueError("Состояние клетки должно быть непустой строкой")
-        return state
-
-    def set_base_state(self, position: Position, state: CellState | str) -> "Maze":
-        self.cell_at(position).base_state = self._validate_state(state)
-        self._notify()
-        return self
-
-    def _push_state(
-        self, position: Position, state: CellState | str, ttl: int,
-        *, owner: object | None = None,
-    ):
-        if type(ttl) is not int or ttl <= 0:
-            raise ValueError("ttl должен быть положительным целым числом")
-        self.cell_at(position)._states.append(
-            TimedCellState(self._validate_state(state), self._tick + ttl, owner)
-        )
-
-    def push_state(
-        self, position: Position, state: CellState | str, ttl: int,
-    ) -> "Maze":
-        """Временно перекрыть состояние клетки на указанное число тиков."""
-        self._push_state(position, state, ttl)
-        self._notify()
-        return self
-
-    def _clear_states(
-        self, position: Position | None = None, state: CellState | str | None = None,
-    ):
-        if state is not None:
-            state = self._validate_state(state)
-        cells = (
-            (self.cell_at(position),)
-            if position is not None
-            else tuple(cell for row in self.cells for cell in row)
-        )
-        for cell in cells:
-            if state is None:
-                cell._states.clear()
-            else:
-                cell._states[:] = [item for item in cell._states if item.value != state]
-
-    def _clear_owned_states(self, state: CellState | str, owner: object):
-        state = self._validate_state(state)
-        for row in self.cells:
-            for cell in row:
-                cell._states[:] = [
-                    item for item in cell._states
-                    if item.value != state or item.owner is not owner
-                ]
-
-    def clear_states(
-        self, position: Position | None = None, *, state: CellState | str | None = None,
-    ) -> "Maze":
-        """Удалить временные состояния одной клетки или всего лабиринта."""
-        self._clear_states(position, state)
-        self._notify()
-        return self
-
-    def _advance_tick(self):
-        self._tick += 1
-        for row in self.cells:
-            for cell in row:
-                cell._states[:] = [
-                    state for state in cell._states
-                    if state.expires_at > self._tick
-                ]
-
-    def tick(self) -> "Maze":
-        """Продвинуть игровое время и удалить все протухшие состояния."""
-        self._advance_tick()
-        self._notify()
-        return self
-
     def adjacent(self, position: Position, direction: Direction | str) -> Position:
-        """Закольцованный геометрический сосед, независимо от стены."""
         x, y = self.validate_position(position)
         dx, dy = Direction(direction).delta
         return (x + dx) % self.width, (y + dy) % self.height
 
-    def reset(self, *, mode: str = "open") -> "Maze":
-        """`open` открывает все ссылки, `closed` удаляет все ссылки."""
-        if mode not in ("open", "closed"):
-            raise ValueError("mode должен быть 'open' или 'closed'")
-        for row in self.cells:
-            for cell in row:
-                for direction in Direction:
-                    neighbor = self.cell_at(self.adjacent(cell.position, direction))
-                    setattr(cell, direction.value, neighbor if mode == "open" else None)
+    def neighbor(self, position: Position, direction: Direction | str) -> Cell:
+        return self.cell_at(self.adjacent(position, direction))
+
+    def can_move(self, position: Position, direction: Direction | str) -> bool:
+        return not self.cell_at(position).side(direction).closed
+
+    def neighbors(self, position: Position) -> tuple[Position, ...]:
+        return tuple(self.adjacent(position, direction) for direction in Direction
+                     if self.can_move(position, direction))
+
+    def place_on(self, position: Position, obj: PlaceObject) -> "Grid":
+        self.cell_at(position).place.install(obj)
+        return self
+
+    def remove_from(self, position: Position, obj: PlaceObject) -> "Grid":
+        self.cell_at(position).place.remove(obj)
+        return self
+
+    def objects_at(self, position: Position) -> tuple[PlaceObject, ...]:
+        return self.cell_at(position).place.objects
+
+    def place_between(self, position: Position, direction: Direction | str,
+                      obj: PlaceObject) -> "Grid":
+        self.cell_at(position).side(direction).install(obj)
+        return self
+
+    def remove_between(self, position: Position, direction: Direction | str,
+                       obj: PlaceObject) -> "Grid":
+        self.cell_at(position).side(direction).remove(obj)
+        return self
+
+    def objects_between(self, position: Position, direction: Direction | str
+                        ) -> tuple[PlaceObject, ...]:
+        return self.cell_at(position).side(direction).objects
+
+    def _place_changed(self, place: Place):
+        if place.needs_tick:
+            self._active_places.add(place)
+        else:
+            self._active_places.discard(place)
         self._notify()
+
+    def _notify(self):
+        if self._batch_depth:
+            self._pending_notify = True
+        else:
+            super()._notify()
+
+    @contextmanager
+    def batch(self, *, notify: bool = True):
+        """Объединить изменения агрегатов в одно уведомление сетки."""
+        self._batch_depth += 1
+        try:
+            yield
+        finally:
+            self._batch_depth -= 1
+            if self._batch_depth == 0 and self._pending_notify:
+                self._pending_notify = False
+                if notify:
+                    self._notify()
+
+    def tick(self) -> "Grid":
+        with self.batch():
+            self._tick += 1
+            for place in tuple(self._active_places):
+                place.tick()
+            self._notify()
+        return self
+
+
+class ClosedMaze(Grid):
+    """Только этот класс знает стены; Grid работает с обычными объектами."""
+
+    @dataclass(frozen=True, slots=True, kw_only=True)
+    class _Wall(PlaceObject):
+        layer: int = 3
+        blocks_movement: bool = True
+
+    def __init__(self, width: int, height: int, *, entrance: Position = (0, 0),
+                 exit: Position | None = None):
+        super().__init__(width, height, entrance=entrance, exit=exit)
+        with self.batch():
+            for location, _ in self.edge_places:
+                self.add_wall(location.position, location.direction)
+
+    def has_wall(self, position: Position, direction: Direction | str) -> bool:
+        return any(isinstance(obj, self._Wall)
+                   for obj in self.objects_between(position, direction))
+
+    def add_wall(self, position: Position, direction: Direction | str) -> "ClosedMaze":
+        if not self.has_wall(position, direction):
+            self.place_between(position, direction, self._Wall())
+        return self
+
+    def remove_wall(self, position: Position, direction: Direction | str) -> "ClosedMaze":
+        self.cell_at(position).side(direction).remove_where(
+            lambda obj: isinstance(obj, self._Wall)
+        )
         return self
 
     def _direction_between(self, a: Position, b: Position) -> Direction:
@@ -295,95 +425,99 @@ class Maze(Observable):
         self.validate_position(b)
         ax, ay = a
         bx, by = b
-        direct = {
-            (0, -1): Direction.UP,
-            (1, 0): Direction.RIGHT,
-            (0, 1): Direction.DOWN,
-            (-1, 0): Direction.LEFT,
-        }.get((bx - ax, by - ay))
+        direct = {(0, -1): Direction.UP, (1, 0): Direction.RIGHT,
+                  (0, 1): Direction.DOWN, (-1, 0): Direction.LEFT}.get((bx - ax, by - ay))
         if direct is not None:
             return direct
         for direction in Direction:
             if self.adjacent(a, direction) == b:
                 return direction
-        raise ValueError("Связать можно только соседние клетки, включая клетки через край")
+        raise ValueError("Связать можно только соседние клетки")
 
-    def _set_link(self, position: Position, direction: Direction | str, opened: bool):
-        direction = Direction(direction)
-        cell = self.cell_at(position)
-        neighbor = self.cell_at(self.adjacent(position, direction))
-        setattr(cell, direction.value, neighbor if opened else None)
-        setattr(neighbor, direction.opposite.value, cell if opened else None)
+    def connect(self, a: Position, b: Position) -> "ClosedMaze":
+        return self.remove_wall(a, self._direction_between(a, b))
 
-    def connect(self, a: Position, b: Position) -> "Maze":
-        """Открыть связь между соседями; для неоднозначных краёв лучше remove_wall."""
-        self._set_link(a, self._direction_between(a, b), True)
-        self._notify()
-        return self
-
-    def disconnect(self, a: Position, b: Position) -> "Maze":
-        """Закрыть связь между соседями; для неоднозначных краёв лучше add_wall."""
-        self._set_link(a, self._direction_between(a, b), False)
-        self._notify()
-        return self
+    def disconnect(self, a: Position, b: Position) -> "ClosedMaze":
+        return self.add_wall(a, self._direction_between(a, b))
 
     def is_connected(self, a: Position, b: Position) -> bool:
-        direction = self._direction_between(a, b)
-        neighbor = self.cell_at(a).neighbor(direction)
-        return neighbor is not None and neighbor.position == b
+        return self.can_move(a, self._direction_between(a, b))
 
-    def add_wall(self, position: Position, direction: Direction | str) -> "Maze":
-        self._set_link(position, direction, False)
-        self._notify()
-        return self
-
-    def remove_wall(self, position: Position, direction: Direction | str) -> "Maze":
-        self._set_link(position, direction, True)
-        self._notify()
-        return self
-
-    def has_wall(self, position: Position, direction: Direction | str) -> bool:
-        return self.cell_at(position).neighbor(direction) is None
-
-    def can_move(self, position: Position, direction: Direction | str) -> bool:
-        return not self.has_wall(position, direction)
-
-    def neighbors(self, position: Position) -> tuple[Position, ...]:
-        """Доступные соседи по направлениям up, right, down, left."""
-        cell = self.cell_at(position)
-        return tuple(
-            neighbor.position
-            for direction in Direction
-            if (neighbor := cell.neighbor(direction)) is not None
-        )
-
-    def open_path(self, positions: Iterable[Position]) -> "Maze":
+    def open_path(self, positions: Iterable[Position]) -> "ClosedMaze":
         positions = list(positions)
-        directions = [self._direction_between(a, b) for a, b in zip(positions, positions[1:])]
         for position in positions:
             self.validate_position(position)
-        for position, direction in zip(positions, directions):
-            self._set_link(position, direction, True)
-        self._notify()
+        directions = [self._direction_between(a, b) for a, b in zip(positions, positions[1:])]
+        with self.batch():
+            for position, direction in zip(positions, directions):
+                self.remove_wall(position, direction)
         return self
+
+
+class SpiralMaze(ClosedMaze):
+    """Спираль по часовой стрелке от (0, 0) до центра поля."""
+
+    def __init__(self, width: int, height: int):
+        super().__init__(width, height, entrance=(0, 0), exit=(0, 0))
+        self._spiral_path = self._build_spiral_path()
+        with self.batch():
+            self.exit = self._spiral_path[-1]
+            self.open_path(self._spiral_path)
+
+    @property
+    def spiral_path(self) -> tuple[Position, ...]:
+        return self._spiral_path
+
+    def _build_spiral_path(self) -> tuple[Position, ...]:
+        positions = []
+        left, right = 0, self.width - 1
+        top, bottom = 0, self.height - 1
+
+        while left <= right and top <= bottom:
+            for x in range(left, right + 1):
+                positions.append((x, top))
+            top += 1
+
+            for y in range(top, bottom + 1):
+                positions.append((right, y))
+            right -= 1
+
+            if top <= bottom:
+                for x in range(right, left - 1, -1):
+                    positions.append((x, bottom))
+                bottom -= 1
+
+            if left <= right:
+                for y in range(bottom, top - 1, -1):
+                    positions.append((left, y))
+                left += 1
+
+        return tuple(positions)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TrailLine(PlaceObject):
+    layer: int = 3
+    owner: object = field(repr=False, compare=False)
+    sequence: int
+    start: Position
+    end: Position
+    direction: Direction
+    color: str
 
 
 class Mouse(Observable):
-    """Мышка переходит по ссылкам между объектами Cell."""
+    """Мышь движется по геометрии Grid и оставляет объекты на рёбрах."""
 
-    FADING_TRAIL_TTL = 2
-    FADED_TRAIL_TTL = 3
-
-    def __init__(self, maze: Maze, *, trail_ttl: int | None = None):
+    def __init__(self, grid: Grid):
         super().__init__()
-        if trail_ttl is not None and (type(trail_ttl) is not int or trail_ttl <= 0):
-            raise ValueError("trail_ttl должен быть положительным целым числом или None")
-        self.maze = maze
-        self._trail_ttl = trail_ttl
-        self._trail_owner = object()
-        self._cell = maze.cell_at(maze.entrance)
+        self.grid = grid
+        self._cell = grid.cell_at(grid.entrance)
         self._trail = [self.position]
         self._last_direction: Direction | None = None
+        self._trail_owner = object()
+        self._sequence = 0
+        self._trail_places: set[Place] = set()
 
     @property
     def cell(self) -> Cell:
@@ -398,19 +532,22 @@ class Mouse(Observable):
         return tuple(self._trail)
 
     @property
-    def trail_ttl(self) -> int | None:
-        return self._trail_ttl
-
-    @property
     def last_direction(self) -> Direction | None:
         return self._last_direction
 
     @property
     def at_exit(self) -> bool:
-        return self.position == self.maze.exit
+        return self.position == self.grid.exit
 
     def can_move(self, direction: Direction | str) -> bool:
-        return self.cell.neighbor(direction) is not None
+        return self.grid.can_move(self.position, direction)
+
+    def _line(self, start: Position, direction: Direction) -> TrailLine:
+        common = dict(owner=self._trail_owner, sequence=self._sequence,
+                      start=start, end=self.position, direction=direction, ttl=1)
+        faded = TrailLine(**common, color="#dbeafe")
+        fading = TrailLine(**common, color="#bfdbfe", next_object=faded)
+        return TrailLine(**common, color="#93c5fd", next_object=fading)
 
     def move(self, direction: Direction | str, steps: int = 1) -> int:
         direction = Direction(direction)
@@ -418,32 +555,21 @@ class Mouse(Observable):
             raise ValueError("steps должен быть неотрицательным целым числом")
         moved = 0
         for _ in range(steps):
-            neighbor = self.cell.neighbor(direction)
-            if neighbor is None:
+            if not self.can_move(direction):
                 break
             previous = self.position
-            self._cell = neighbor
-            self._last_direction = direction
-            self._trail.append(self.position)
-            self.maze._advance_tick()
-            if self.trail_ttl is not None:
-                self.maze._push_state(
-                    previous,
-                    CellState.FADED_TRAIL,
-                    self.FADED_TRAIL_TTL,
-                    owner=self._trail_owner,
-                )
-                self.maze._push_state(
-                    previous,
-                    CellState.FADING_TRAIL,
-                    self.FADING_TRAIL_TTL,
-                    owner=self._trail_owner,
-                )
-                self.maze._push_state(
-                    previous, CellState.TRAIL, self.trail_ttl, owner=self._trail_owner,
-                )
+            place = self.cell.side(direction)
+            with self.grid.batch(notify=False):
+                self._cell = self.grid.neighbor(previous, direction)
+                self._last_direction = direction
+                self._trail.append(self.position)
+                self._sequence += 1
+                self.grid.tick()
+                self._trail_places.intersection_update(self.grid.active_places)
+                place.install(self._line(previous, direction))
+                self._trail_places.add(place)
             moved += 1
-            self._notify_all(self.maze, self)
+            self._notify_all(self.grid, self)
         if moved == 0:
             self._notify()
         return moved
@@ -461,16 +587,15 @@ class Mouse(Observable):
         return self.move(Direction.LEFT, steps)
 
     def reset(self):
-        self._cell = self.maze.cell_at(self.maze.entrance)
-        self._trail = [self.position]
-        self._last_direction = None
-        if self.trail_ttl is not None:
-            self.maze._clear_owned_states(CellState.TRAIL, self._trail_owner)
-            self.maze._clear_owned_states(CellState.FADING_TRAIL, self._trail_owner)
-            self.maze._clear_owned_states(CellState.FADED_TRAIL, self._trail_owner)
-            self._notify_all(self.maze, self)
-        else:
-            self._notify()
+        with self.grid.batch(notify=False):
+            self._cell = self.grid.cell_at(self.grid.entrance)
+            self._trail = [self.position]
+            self._last_direction = None
+            for place in self._trail_places:
+                place.remove_where(lambda obj: isinstance(obj, TrailLine)
+                                   and obj.owner is self._trail_owner)
+            self._trail_places.clear()
+        self._notify_all(self.grid, self)
 
     async def walk(self, directions: Iterable[Direction | str], *, delay: float = 0.2) -> int:
         if delay < 0:
