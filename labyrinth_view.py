@@ -1,14 +1,18 @@
 """SVG-представление через стандартный вывод Jupyter, без GUI-виджетов."""
 
+from collections.abc import Mapping
+from html import escape
+
 from IPython.display import SVG, display
 
-from labyrinth import Maze, Mouse
+from labyrinth import CellState, Maze, Mouse
 
 
 class MazeView:
     def __init__(
         self, maze: Maze, mouse: Mouse | None = None, *,
         cell_size: int = 48, show_trail: bool = True, show_grid: bool = True,
+        state_colors: Mapping[CellState | str, str] | None = None,
     ):
         if type(cell_size) is not int or cell_size < 24:
             raise ValueError("cell_size должен быть целым числом не меньше 24")
@@ -20,6 +24,12 @@ class MazeView:
         self.margin = 12
         self._show_trail = bool(show_trail)
         self._show_grid = bool(show_grid)
+        self.state_colors = {
+            CellState.TRAIL: "#93c5fd",
+            CellState.FADING_TRAIL: "#bfdbfe",
+            CellState.FADED_TRAIL: "#dbeafe",
+            **(state_colors or {}),
+        }
         self._handles = []
         self._unsubscribers = [maze.subscribe(self.redraw), self.mouse.subscribe(self.redraw)]
 
@@ -59,13 +69,45 @@ class MazeView:
         def polyline(points, color, thickness):
             coordinates = " ".join(f"{x},{y}" for x, y in points)
             parts.append(f'<polyline points="{coordinates}" fill="none" '
-                         f'stroke="{color}" stroke-width="{thickness}" '
-                         'stroke-linecap="round" stroke-linejoin="round"/>')
+                          f'stroke="{color}" stroke-width="{thickness}" '
+                          'stroke-linecap="round" stroke-linejoin="round"/>')
+
+        def gradient_line(start, end, start_color, end_color, index):
+            x1, y1 = self._center(start)
+            x2, y2 = self._center(end)
+            gradient_id = f"trail-gradient-{index}"
+            parts.append(
+                f'<defs><linearGradient id="{gradient_id}" gradientUnits="userSpaceOnUse" '
+                f'x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}">'
+                f'<stop offset="0%" stop-color="{start_color}"/>'
+                f'<stop offset="100%" stop-color="{end_color}"/>'
+                '</linearGradient></defs>'
+            )
+            polyline([(x1, y1), (x2, y2)], f"url(#{gradient_id})", 3)
 
         def circle(point, radius, color):
             x, y = point
             parts.append(f'<circle cx="{x}" cy="{y}" r="{radius}" fill="{color}"/>')
 
+        trail_states = (
+            CellState.TRAIL,
+            CellState.FADING_TRAIL,
+            CellState.FADED_TRAIL,
+        )
+        for position in self.maze.positions:
+            cell = self.maze.cell_at(position)
+            state = cell.state
+            if state in trail_states and not self.show_trail:
+                state = next(
+                    (item.value for item in reversed(cell.states)
+                     if item.value not in trail_states),
+                    cell.base_state,
+                )
+            color = None if state in trail_states else self.state_colors.get(state)
+            if color is not None:
+                color = escape(color, quote=True)
+                parts.append(f'<rect x="{m + position[0] * s}" y="{m + position[1] * s}" '
+                             f'width="{s}" height="{s}" fill="{color}"/>')
         for cell, color in ((self.maze.entrance, "#bbf7d0"), (self.maze.exit, "#fed7aa")):
             parts.append(f'<rect x="{m + cell[0] * s}" y="{m + cell[1] * s}" '
                          f'width="{s}" height="{s}" fill="{color}"/>')
@@ -90,7 +132,28 @@ class MazeView:
             if y == self.maze.height - 1 and self.maze.has_wall((x, y), "down"):
                 line(m + x * s, m + self.maze.height * s,
                      m + (x + 1) * s, m + self.maze.height * s)
-        if self.show_trail and len(self.mouse.trail) > 1:
+        if self.show_trail and self.mouse.trail_ttl is not None:
+            segments = []
+            seen = set()
+            for start, end in reversed(tuple(zip(self.mouse.trail, self.mouse.trail[1:]))):
+                if start in seen:
+                    continue
+                seen.add(start)
+                state = self.maze.cell_at(start).state
+                if state not in trail_states:
+                    continue
+                if abs(end[0] - start[0]) + abs(end[1] - start[1]) > 1:
+                    continue
+                segments.append((start, end, state))
+            for index, (start, end, state) in enumerate(reversed(segments)):
+                start_color = escape(self.state_colors[state], quote=True)
+                end_state = self.maze.cell_at(end).state
+                end_color = escape(
+                    self.state_colors.get(end_state, self.state_colors[state]),
+                    quote=True,
+                )
+                gradient_line(start, end, start_color, end_color, index)
+        elif self.show_trail and len(self.mouse.trail) > 1:
             segment = [self.mouse.trail[0]]
             for cell in self.mouse.trail[1:]:
                 previous = segment[-1]

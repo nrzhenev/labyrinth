@@ -21,7 +21,7 @@ def create_demo():
     )
     maze.open_path([(2, 0), (3, 0), (4, 0), (4, 1)])  # Тупик.
     maze.open_path([(1, 2), (0, 2), (0, 3)])  # Ещё один тупик.
-    mouse = Mouse(maze)
+    mouse = Mouse(maze, trail_ttl=1)
     return maze, mouse, MazeView(maze, mouse)
 
 

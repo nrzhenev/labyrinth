@@ -8,6 +8,20 @@ from enum import Enum
 Position = tuple[int, int]
 
 
+class CellState(str, Enum):
+    NORMAL = "normal"
+    TRAIL = "trail"
+    FADING_TRAIL = "fading_trail"
+    FADED_TRAIL = "faded_trail"
+
+
+@dataclass(frozen=True, slots=True)
+class TimedCellState:
+    value: CellState | str
+    expires_at: int
+    owner: object | None = field(default=None, repr=False, compare=False)
+
+
 class Direction(str, Enum):
     UP = "up"
     RIGHT = "right"
@@ -46,10 +60,22 @@ class Cell:
     right: "Cell | None" = field(default=None, repr=False)
     down: "Cell | None" = field(default=None, repr=False)
     left: "Cell | None" = field(default=None, repr=False)
+    base_state: CellState | str = field(default=CellState.NORMAL, repr=False)
+    _states: list[TimedCellState] = field(default_factory=list, repr=False)
 
     @property
     def position(self) -> Position:
         return self.x, self.y
+
+    @property
+    def state(self) -> CellState | str:
+        """Последнее временное состояние или постоянное базовое состояние."""
+        return self._states[-1].value if self._states else self.base_state
+
+    @property
+    def states(self) -> tuple[TimedCellState, ...]:
+        """Неизменяемый снимок временных состояний от старых к новым."""
+        return tuple(self._states)
 
     def neighbor(self, direction: Direction | str) -> "Cell | None":
         return getattr(self, Direction(direction).value)
@@ -69,7 +95,16 @@ class Observable:
         return unsubscribe
 
     def _notify(self):
-        for callback in tuple(self._listeners):
+        self._notify_all(self)
+
+    @staticmethod
+    def _notify_all(*observables: "Observable"):
+        callbacks = []
+        for observable in observables:
+            for callback in tuple(observable._listeners):
+                if callback not in callbacks:
+                    callbacks.append(callback)
+        for callback in callbacks:
             callback()
 
 
@@ -94,6 +129,7 @@ class Maze(Observable):
         if type(width) is not int or type(height) is not int or min(width, height) < 1:
             raise ValueError("Размеры должны быть положительными целыми числами")
         self._width, self._height = width, height
+        self._tick = 0
         self.cells = [[Cell(x, y) for x in range(width)] for y in range(height)]
         self.root = self.cells[0][0]
         self._entrance = self.validate_position(entrance)
@@ -107,6 +143,10 @@ class Maze(Observable):
     @property
     def height(self) -> int:
         return self._height
+
+    @property
+    def current_tick(self) -> int:
+        return self._tick
 
     @property
     def positions(self) -> tuple[Position, ...]:
@@ -154,6 +194,83 @@ class Maze(Observable):
     def cell_at(self, position: Position) -> Cell:
         x, y = self.validate_position(position)
         return self.cells[y][x]
+
+    @staticmethod
+    def _validate_state(state: CellState | str) -> CellState | str:
+        if not isinstance(state, str) or not state:
+            raise ValueError("Состояние клетки должно быть непустой строкой")
+        return state
+
+    def set_base_state(self, position: Position, state: CellState | str) -> "Maze":
+        self.cell_at(position).base_state = self._validate_state(state)
+        self._notify()
+        return self
+
+    def _push_state(
+        self, position: Position, state: CellState | str, ttl: int,
+        *, owner: object | None = None,
+    ):
+        if type(ttl) is not int or ttl <= 0:
+            raise ValueError("ttl должен быть положительным целым числом")
+        self.cell_at(position)._states.append(
+            TimedCellState(self._validate_state(state), self._tick + ttl, owner)
+        )
+
+    def push_state(
+        self, position: Position, state: CellState | str, ttl: int,
+    ) -> "Maze":
+        """Временно перекрыть состояние клетки на указанное число тиков."""
+        self._push_state(position, state, ttl)
+        self._notify()
+        return self
+
+    def _clear_states(
+        self, position: Position | None = None, state: CellState | str | None = None,
+    ):
+        if state is not None:
+            state = self._validate_state(state)
+        cells = (
+            (self.cell_at(position),)
+            if position is not None
+            else tuple(cell for row in self.cells for cell in row)
+        )
+        for cell in cells:
+            if state is None:
+                cell._states.clear()
+            else:
+                cell._states[:] = [item for item in cell._states if item.value != state]
+
+    def _clear_owned_states(self, state: CellState | str, owner: object):
+        state = self._validate_state(state)
+        for row in self.cells:
+            for cell in row:
+                cell._states[:] = [
+                    item for item in cell._states
+                    if item.value != state or item.owner is not owner
+                ]
+
+    def clear_states(
+        self, position: Position | None = None, *, state: CellState | str | None = None,
+    ) -> "Maze":
+        """Удалить временные состояния одной клетки или всего лабиринта."""
+        self._clear_states(position, state)
+        self._notify()
+        return self
+
+    def _advance_tick(self):
+        self._tick += 1
+        for row in self.cells:
+            for cell in row:
+                cell._states[:] = [
+                    state for state in cell._states
+                    if state.expires_at > self._tick
+                ]
+
+    def tick(self) -> "Maze":
+        """Продвинуть игровое время и удалить все протухшие состояния."""
+        self._advance_tick()
+        self._notify()
+        return self
 
     def adjacent(self, position: Position, direction: Direction | str) -> Position:
         """Закольцованный геометрический сосед, независимо от стены."""
@@ -254,9 +371,16 @@ class Maze(Observable):
 class Mouse(Observable):
     """Мышка переходит по ссылкам между объектами Cell."""
 
-    def __init__(self, maze: Maze):
+    FADING_TRAIL_TTL = 2
+    FADED_TRAIL_TTL = 3
+
+    def __init__(self, maze: Maze, *, trail_ttl: int | None = None):
         super().__init__()
+        if trail_ttl is not None and (type(trail_ttl) is not int or trail_ttl <= 0):
+            raise ValueError("trail_ttl должен быть положительным целым числом или None")
         self.maze = maze
+        self._trail_ttl = trail_ttl
+        self._trail_owner = object()
         self._cell = maze.cell_at(maze.entrance)
         self._trail = [self.position]
         self._last_direction: Direction | None = None
@@ -272,6 +396,10 @@ class Mouse(Observable):
     @property
     def trail(self) -> tuple[Position, ...]:
         return tuple(self._trail)
+
+    @property
+    def trail_ttl(self) -> int | None:
+        return self._trail_ttl
 
     @property
     def last_direction(self) -> Direction | None:
@@ -293,11 +421,29 @@ class Mouse(Observable):
             neighbor = self.cell.neighbor(direction)
             if neighbor is None:
                 break
+            previous = self.position
             self._cell = neighbor
             self._last_direction = direction
             self._trail.append(self.position)
+            self.maze._advance_tick()
+            if self.trail_ttl is not None:
+                self.maze._push_state(
+                    previous,
+                    CellState.FADED_TRAIL,
+                    self.FADED_TRAIL_TTL,
+                    owner=self._trail_owner,
+                )
+                self.maze._push_state(
+                    previous,
+                    CellState.FADING_TRAIL,
+                    self.FADING_TRAIL_TTL,
+                    owner=self._trail_owner,
+                )
+                self.maze._push_state(
+                    previous, CellState.TRAIL, self.trail_ttl, owner=self._trail_owner,
+                )
             moved += 1
-            self._notify()
+            self._notify_all(self.maze, self)
         if moved == 0:
             self._notify()
         return moved
@@ -318,7 +464,13 @@ class Mouse(Observable):
         self._cell = self.maze.cell_at(self.maze.entrance)
         self._trail = [self.position]
         self._last_direction = None
-        self._notify()
+        if self.trail_ttl is not None:
+            self.maze._clear_owned_states(CellState.TRAIL, self._trail_owner)
+            self.maze._clear_owned_states(CellState.FADING_TRAIL, self._trail_owner)
+            self.maze._clear_owned_states(CellState.FADED_TRAIL, self._trail_owner)
+            self._notify_all(self.maze, self)
+        else:
+            self._notify()
 
     async def walk(self, directions: Iterable[Direction | str], *, delay: float = 0.2) -> int:
         if delay < 0:
