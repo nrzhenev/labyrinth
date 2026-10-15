@@ -1,9 +1,9 @@
-from labyrinth import ClosedMaze, Mouse
+from labyrinth import ClosedMaze, Game
 from labyrinth_view import MazeView
 
 
 def create_demo():
-    """В Jupyter: maze, mouse, view = create_demo(); display(view)."""
+    """В Jupyter: maze, game, view = create_demo(); display(view)."""
     maze = ClosedMaze(5, 4)
     maze.open_path(
         [
@@ -21,8 +21,8 @@ def create_demo():
     )
     maze.open_path([(2, 0), (3, 0), (4, 0), (4, 1)])  # Тупик.
     maze.open_path([(1, 2), (0, 2), (0, 3)])  # Ещё один тупик.
-    mouse = Mouse(maze)
-    return maze, mouse, MazeView(maze, mouse)
+    game = Game(maze)
+    return maze, game, MazeView(game)
 
 
 def main():

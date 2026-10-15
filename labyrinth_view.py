@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from IPython.display import SVG, display
 
-from labyrinth import Grid, Location, Mouse, ObjectPlacement, PlaceObject, TrailLine
+from labyrinth import Game, Location, ObjectPlacement, PlaceObject, TrailLine
 
 
 @dataclass(slots=True)
@@ -68,15 +68,14 @@ def render_trail_line(view: "MazeView", obj: TrailLine,
 
 class MazeView:
     def __init__(
-        self, grid: Grid, mouse: Mouse | None = None, *,
+        self, game: Game, *,
         cell_size: int = 48, show_trail: bool = True, show_grid: bool = True,
     ):
         if type(cell_size) is not int or cell_size < 24:
             raise ValueError("cell_size должен быть целым числом не меньше 24")
-        if mouse is not None and mouse.grid is not grid:
-            raise ValueError("Мышка должна принадлежать этой сетке")
-        self.grid = grid
-        self.mouse = mouse if mouse is not None else Mouse(grid)
+        self.game = game
+        self.grid = game.grid
+        self.mouse = game.mouse
         self.cell_size = cell_size
         self.margin = 12
         self._show_trail = bool(show_trail)
@@ -84,7 +83,7 @@ class MazeView:
         self._renderers: dict[type[PlaceObject], Renderer] = {TrailLine: render_trail_line}
         self._svg_prefix = f"grid-{uuid4().hex}"
         self._handles = []
-        self._unsubscribers = [grid.subscribe(self.redraw), self.mouse.subscribe(self.redraw)]
+        self._unsubscribers = [self.grid.subscribe(self.redraw), game.subscribe(self.redraw)]
 
     def register_renderer(self, object_type: type[PlaceObject], renderer: Renderer):
         if not issubclass(object_type, PlaceObject) or not callable(renderer):
