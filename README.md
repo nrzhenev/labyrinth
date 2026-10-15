@@ -16,7 +16,7 @@ from labyrinth import Game, SpiralMaze
 from labyrinth_view import MazeView
 
 maze = SpiralMaze(8, 5)
-game = Game(maze)
+game = Game(maze, tick_delay=0.1)
 view = MazeView(game)
 display(view)
 
@@ -31,6 +31,9 @@ game.right()
 game.down()
 game.left()
 ```
+
+`tick_delay` задаёт задержку в секундах после каждого успешного шага. По
+умолчанию задержки нет. Заблокированная команда и `reset()` не ждут.
 
 Каждая команда выполняет не более одного шага. Она возвращает `True`, если
 мышь переместилась, и `False`, если ребро закрыто или игра завершена. Методов

@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import count
+from time import sleep
 
 Position = tuple[int, int]
 _orders = count()
@@ -716,11 +717,15 @@ def endgame(context: InteractionContext) -> InteractionEffect:
 class Game(Observable):
     """Единственная публичная точка движения и применения игровых правил."""
 
-    def __init__(self, grid: Grid):
+    def __init__(self, grid: Grid, *, tick_delay: float = 0):
         super().__init__()
         if grid._game is not None:
             raise ValueError("Grid уже принадлежит другой игре")
+        if (isinstance(tick_delay, bool) or not isinstance(tick_delay, (int, float))
+                or tick_delay < 0):
+            raise ValueError("tick_delay должен быть неотрицательным числом")
         self.grid = grid
+        self.tick_delay = float(tick_delay)
         self.mouse = Mouse(grid, _token=_GAME_TOKEN)
         self.status = GameStatus.RUNNING
         self._acting = True
@@ -881,6 +886,8 @@ class Game(Observable):
             self._publish(events)
         finally:
             self._acting = False
+        if self.tick_delay:
+            sleep(self.tick_delay)
         return True
 
     def up(self) -> bool:

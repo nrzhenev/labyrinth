@@ -286,6 +286,20 @@ class GameTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Game(game.grid)
 
+    def test_tick_delay_applies_only_after_successful_step(self):
+        maze = ClosedMaze(3, 1, exit=(2, 0))
+        game = Game(maze, tick_delay=0.25)
+        with patch("labyrinth.sleep") as sleep:
+            self.assertFalse(game.right())
+            sleep.assert_not_called()
+            maze.remove_wall((0, 0), "right")
+            self.assertTrue(game.right())
+            sleep.assert_called_once_with(0.25)
+
+        for invalid in (-1, True, "1"):
+            with self.assertRaises(ValueError):
+                Game(Grid(2, 1), tick_delay=invalid)
+
     def test_blocked_or_finished_commands_return_false_without_tick(self):
         maze = ClosedMaze(2, 1)
         game = Game(maze)
