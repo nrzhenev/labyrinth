@@ -487,6 +487,16 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(game.grid._listeners, [])
         self.assertEqual(game._listeners, [])
 
+    def test_endgame_dialog_appears_after_reaching_exit(self):
+        game = Game(Grid(2, 1))
+        view = MazeView(game)
+        self.addCleanup(view.close)
+        self.assertNotIn("Игра окончена!", view.to_svg())
+        game.right()
+        svg = view.to_svg()
+        self.assertIn("Игра окончена!", svg)
+        self.assertIn("Мышь добралась до выхода", svg)
+
     def test_demo_and_notebook_use_game_api(self):
         maze, game, view = create_demo()
         self.addCleanup(view.close)

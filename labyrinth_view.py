@@ -197,6 +197,25 @@ class MazeView:
         circle(point(0.29, 0), s * 0.035, "#f9a8d4")
         for side in (-0.06, 0.06):
             circle(point(0.13, side), s * 0.025, "#0f172a")
+
+        if self.game.finished:
+            panel_width = min(width - 2 * m, 6 * s)
+            panel_height = min(height - 2 * m, 2.25 * s)
+            panel_x = (width - panel_width) / 2
+            panel_y = (height - panel_height) / 2
+            parts.extend([
+                f'<rect x="{m}" y="{m}" width="{width - 2 * m}" '
+                f'height="{height - 2 * m}" fill="#0f172a" fill-opacity="0.45"/>',
+                f'<rect x="{panel_x}" y="{panel_y}" width="{panel_width}" '
+                f'height="{panel_height}" rx="12" fill="white" stroke="#fb923c" '
+                'stroke-width="3"/>',
+                f'<text x="{width / 2}" y="{height / 2 - 4}" text-anchor="middle" '
+                'font-family="sans-serif" font-size="20" font-weight="700" '
+                'fill="#0f172a">Игра окончена!</text>',
+                f'<text x="{width / 2}" y="{height / 2 + 22}" text-anchor="middle" '
+                'font-family="sans-serif" font-size="13" fill="#475569">'
+                'Мышь добралась до выхода</text>',
+            ])
         parts.append("</svg>")
         return "".join(parts)
 
