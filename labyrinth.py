@@ -57,6 +57,13 @@ class EndGameEvent(GameEvent):
     position: Position
 
 
+@dataclass(frozen=True, slots=True)
+class WallHitEvent(GameEvent):
+    actor: Mouse
+    position: Position
+    direction: Direction
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PlaceObject:
     """Неизменяемое описание объекта; таймер установки принадлежит Place."""
@@ -839,6 +846,13 @@ class Game(Observable):
         source = self.mouse.position
         edge = self.mouse.cell.side(direction)
         if edge.closed:
+            event = WallHitEvent(self.mouse, source, direction)
+            self.reset()
+            self._acting = True
+            try:
+                self._publish((event,))
+            finally:
+                self._acting = False
             return False
         target = self.grid.adjacent(source, direction)
         self._acting = True

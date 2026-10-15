@@ -3,11 +3,12 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from html import escape
+from threading import Timer
 from uuid import uuid4
 
 from IPython.display import SVG, display
 
-from labyrinth import Game, Location, ObjectPlacement, PlaceObject, TrailLine
+from labyrinth import Game, Location, ObjectPlacement, PlaceObject, TrailLine, WallHitEvent
 
 
 @dataclass(slots=True)
@@ -83,7 +84,35 @@ class MazeView:
         self._renderers: dict[type[PlaceObject], Renderer] = {TrailLine: render_trail_line}
         self._svg_prefix = f"grid-{uuid4().hex}"
         self._handles = []
-        self._unsubscribers = [self.grid.subscribe(self.redraw), game.subscribe(self.redraw)]
+        self._message: str | None = None
+        self._message_timer: Timer | None = None
+        self._unsubscribers = [
+            self.grid.subscribe(self._on_change),
+            game.subscribe(self._on_change),
+            game.subscribe_event(self._on_event),
+        ]
+
+    def _on_change(self):
+        if self._message_timer is not None:
+            self._message_timer.cancel()
+            self._message_timer = None
+        self._message = None
+        self.redraw()
+
+    def _on_event(self, event):
+        if isinstance(event, WallHitEvent):
+            if self._message_timer is not None:
+                self._message_timer.cancel()
+            self._message = "Вы уперлись в стену"
+            self.redraw()
+            self._message_timer = Timer(3, self._hide_message)
+            self._message_timer.daemon = True
+            self._message_timer.start()
+
+    def _hide_message(self):
+        self._message = None
+        self._message_timer = None
+        self.redraw()
 
     def register_renderer(self, object_type: type[PlaceObject], renderer: Renderer):
         if not issubclass(object_type, PlaceObject) or not callable(renderer):
@@ -198,11 +227,14 @@ class MazeView:
         for side in (-0.06, 0.06):
             circle(point(0.13, side), s * 0.025, "#0f172a")
 
-        if self.game.finished:
+        message = "Игра окончена!" if self.game.finished else self._message
+        if message is not None:
             panel_width = min(width - 2 * m, 6 * s)
             panel_height = min(height - 2 * m, 2.25 * s)
             panel_x = (width - panel_width) / 2
             panel_y = (height - panel_height) / 2
+            if not self.game.finished:
+                parts.append('<g>')
             parts.extend([
                 f'<rect x="{m}" y="{m}" width="{width - 2 * m}" '
                 f'height="{height - 2 * m}" fill="#0f172a" fill-opacity="0.45"/>',
@@ -211,11 +243,14 @@ class MazeView:
                 'stroke-width="3"/>',
                 f'<text x="{width / 2}" y="{height / 2 - 4}" text-anchor="middle" '
                 'font-family="sans-serif" font-size="20" font-weight="700" '
-                'fill="#0f172a">Игра окончена!</text>',
+                f'fill="#0f172a">{message}</text>',
                 f'<text x="{width / 2}" y="{height / 2 + 22}" text-anchor="middle" '
                 'font-family="sans-serif" font-size="13" fill="#475569">'
-                'Мышь добралась до выхода</text>',
+                + ('Мышь добралась до выхода' if self.game.finished else 'Игра начата заново')
+                + '</text>',
             ])
+            if not self.game.finished:
+                parts.append('</g>')
         parts.append("</svg>")
         return "".join(parts)
 
@@ -234,6 +269,9 @@ class MazeView:
 
     def close(self):
         """Отключить автообновление; уже показанное изображение остаётся."""
+        if self._message_timer is not None:
+            self._message_timer.cancel()
+            self._message_timer = None
         for unsubscribe in self._unsubscribers:
             unsubscribe()
         self._unsubscribers.clear()

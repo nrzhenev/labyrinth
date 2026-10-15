@@ -25,6 +25,7 @@ from labyrinth import (
     PlaceObject,
     SpiralMaze,
     TrailLine,
+    WallHitEvent,
 )
 from labyrinth_view import MazeView
 from main import create_demo
@@ -297,6 +298,19 @@ class GameTests(unittest.TestCase):
         self.assertFalse(game.left())
         self.assertEqual(maze.current_tick, 1)
 
+    def test_wall_hit_resets_game_and_publishes_event(self):
+        maze = ClosedMaze(3, 1)
+        maze.remove_wall((0, 0), "right")
+        game = Game(maze)
+        events = []
+        game.subscribe_event(events.append)
+        self.assertTrue(game.right())
+        self.assertEqual(game.mouse.position, (1, 0))
+        self.assertFalse(game.right())
+        self.assertEqual(game.mouse.position, maze.entrance)
+        self.assertEqual(game.mouse.trail, (maze.entrance,))
+        self.assertIsInstance(events[-1], WallHitEvent)
+
     def test_tick_edge_destination_order_and_context(self):
         grid = Grid(3, 1, exit=(2, 0))
         game = Game(grid)
@@ -496,6 +510,26 @@ class ViewTests(unittest.TestCase):
         svg = view.to_svg()
         self.assertIn("Игра окончена!", svg)
         self.assertIn("Мышь добралась до выхода", svg)
+
+    def test_wall_hit_dialog_appears_after_game_reset(self):
+        game = Game(ClosedMaze(2, 1))
+        view = MazeView(game)
+        self.addCleanup(view.close)
+        with patch("labyrinth_view.Timer") as timer:
+            first, second = Mock(), Mock()
+            timer.side_effect = [first, second]
+            self.assertFalse(game.right())
+            svg = view.to_svg()
+            self.assertIn("Вы уперлись в стену", svg)
+            self.assertIn("Игра начата заново", svg)
+            timer.assert_called_once_with(3, view._hide_message)
+            first.start.assert_called_once_with()
+
+            self.assertFalse(game.right())
+            first.cancel.assert_called_once_with()
+            second.start.assert_called_once_with()
+            timer.call_args.args[1]()
+            self.assertNotIn("Вы уперлись в стену", view.to_svg())
 
     def test_demo_and_notebook_use_game_api(self):
         maze, game, view = create_demo()
