@@ -22,13 +22,21 @@ class Direction(str, Enum):
 
     @property
     def delta(self) -> Position:
-        return {self.UP: (0, -1), self.RIGHT: (1, 0),
-                self.DOWN: (0, 1), self.LEFT: (-1, 0)}[self]
+        return {
+            self.UP: (0, -1),
+            self.RIGHT: (1, 0),
+            self.DOWN: (0, 1),
+            self.LEFT: (-1, 0),
+        }[self]
 
     @property
     def opposite(self) -> "Direction":
-        return {self.UP: self.DOWN, self.RIGHT: self.LEFT,
-                self.DOWN: self.UP, self.LEFT: self.RIGHT}[self]
+        return {
+            self.UP: self.DOWN,
+            self.RIGHT: self.LEFT,
+            self.DOWN: self.UP,
+            self.LEFT: self.RIGHT,
+        }[self]
 
 
 class InteractionPhase(str, Enum):
@@ -74,8 +82,12 @@ class PlaceObject:
     blocks_movement: bool = False
     ttl: int | None = None
     next_object: "PlaceObject | None" = None
-    on_interact: Callable[[InteractionContext], InteractionEffect | None] | None = field(
-        default=None, repr=False, compare=False,
+    on_interact: Callable[[InteractionContext], InteractionEffect | None] | None = (
+        field(
+            default=None,
+            repr=False,
+            compare=False,
+        )
     )
 
     def __post_init__(self):
@@ -156,8 +168,9 @@ class Place:
     def _discard(self, entry: _PlaceEntry):
         self._blocking_count -= entry.blocking
         self._timed_count -= entry.remaining_ttl is not None
-        self._interactive_entries[:] = [item for item in self._interactive_entries
-                                        if item is not entry]
+        self._interactive_entries[:] = [
+            item for item in self._interactive_entries if item is not entry
+        ]
 
     def _ensure_mutable(self):
         if self._interacting:
@@ -181,7 +194,9 @@ class Place:
         if not removed:
             return 0
         removed_ids = {id(entry) for entry in removed}
-        self._entries[:] = [entry for entry in self._entries if id(entry) not in removed_ids]
+        self._entries[:] = [
+            entry for entry in self._entries if id(entry) not in removed_ids
+        ]
         for entry in removed:
             self._discard(entry)
         self._changed()
@@ -229,7 +244,9 @@ class Place:
                 if effect is None:
                     effect = InteractionEffect()
                 if not isinstance(effect, InteractionEffect):
-                    raise TypeError("on_interact должен вернуть InteractionEffect или None")
+                    raise TypeError(
+                        "on_interact должен вернуть InteractionEffect или None"
+                    )
                 effects.append((entry, effect))
         finally:
             self._interacting = False
@@ -257,7 +274,9 @@ class Place:
             events.extend(effect.events)
             if effect.replacement is KEEP:
                 continue
-            index = next((i for i, item in enumerate(self._entries) if item is entry), None)
+            index = next(
+                (i for i, item in enumerate(self._entries) if item is entry), None
+            )
             if index is None:
                 continue
             self._discard(entry)
@@ -361,8 +380,14 @@ class Observable:
 class Grid(Observable):
     """Открытая тороидальная геометрия с Place на клетках и рёбрах."""
 
-    def __init__(self, width: int, height: int, *, entrance: Position = (0, 0),
-                 exit: Position | None = None):
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        *,
+        entrance: Position = (0, 0),
+        exit: Position | None = None,
+    ):
         super().__init__()
         if type(width) is not int or type(height) is not int or min(width, height) < 1:
             raise ValueError("Размеры должны быть положительными целыми числами")
@@ -372,18 +397,24 @@ class Grid(Observable):
         self._game: Game | None = None
         self._batch_depth = 0
         self._pending_notify = False
-        self.cells = [[Cell(x, y, Place(self._place_changed)) for x in range(width)]
-                      for y in range(height)]
+        self.cells = [
+            [Cell(x, y, Place(self._place_changed)) for x in range(width)]
+            for y in range(height)
+        ]
         self.root = self.cells[0][0]
         self._entrance = self.validate_position(entrance)
-        self._exit = self.validate_position(exit if exit is not None else (width - 1, height - 1))
+        self._exit = self.validate_position(
+            exit if exit is not None else (width - 1, height - 1)
+        )
         self._edges: list[tuple[Location, Place]] = []
         for row in self.cells:
             for cell in row:
                 for direction in (Direction.RIGHT, Direction.DOWN):
                     place = Place(self._place_changed)
                     cell._sides[direction] = place
-                    self.neighbor(cell.position, direction)._sides[direction.opposite] = place
+                    self.neighbor(cell.position, direction)._sides[
+                        direction.opposite
+                    ] = place
                     self._edges.append((Location(cell.position, direction), place))
 
     @property
@@ -413,17 +444,24 @@ class Grid(Observable):
 
     @property
     def placements(self) -> tuple[ObjectPlacement, ...]:
-        places = [(Location(cell.position), cell.place)
-                  for row in self.cells for cell in row]
+        places = [
+            (Location(cell.position), cell.place) for row in self.cells for cell in row
+        ]
         places.extend(self._edges)
-        return tuple(ObjectPlacement(entry.object, place, location, entry.order)
-                     for location, place in places for entry in place._entries)
+        return tuple(
+            ObjectPlacement(entry.object, place, location, entry.order)
+            for location, place in places
+            for entry in place._entries
+        )
 
     @property
     def links(self) -> tuple[tuple[Position, str, Position], ...]:
-        return tuple((position, direction.value, self.adjacent(position, direction))
-                     for position in self.positions for direction in Direction
-                     if self.can_move(position, direction))
+        return tuple(
+            (position, direction.value, self.adjacent(position, direction))
+            for position in self.positions
+            for direction in Direction
+            if self.can_move(position, direction)
+        )
 
     @property
     def entrance(self) -> Position:
@@ -442,9 +480,12 @@ class Grid(Observable):
         self._notify()
 
     def validate_position(self, position: Position) -> Position:
-        if (not isinstance(position, tuple) or len(position) != 2
+        if (
+            not isinstance(position, tuple)
+            or len(position) != 2
             or any(type(value) is not int for value in position)
-            or not (0 <= position[0] < self.width and 0 <= position[1] < self.height)):
+            or not (0 <= position[0] < self.width and 0 <= position[1] < self.height)
+        ):
             raise ValueError(f"Клетка вне сетки или некорректна: {position!r}")
         return position
 
@@ -464,8 +505,11 @@ class Grid(Observable):
         return not self.cell_at(position).side(direction).closed
 
     def neighbors(self, position: Position) -> tuple[Position, ...]:
-        return tuple(self.adjacent(position, direction) for direction in Direction
-                     if self.can_move(position, direction))
+        return tuple(
+            self.adjacent(position, direction)
+            for direction in Direction
+            if self.can_move(position, direction)
+        )
 
     def place_on(self, position: Position, obj: PlaceObject) -> "Grid":
         self.cell_at(position).place.install(obj)
@@ -478,18 +522,21 @@ class Grid(Observable):
     def objects_at(self, position: Position) -> tuple[PlaceObject, ...]:
         return self.cell_at(position).place.objects
 
-    def place_between(self, position: Position, direction: Direction | str,
-                      obj: PlaceObject) -> "Grid":
+    def place_between(
+        self, position: Position, direction: Direction | str, obj: PlaceObject
+    ) -> "Grid":
         self.cell_at(position).side(direction).install(obj)
         return self
 
-    def remove_between(self, position: Position, direction: Direction | str,
-                       obj: PlaceObject) -> "Grid":
+    def remove_between(
+        self, position: Position, direction: Direction | str, obj: PlaceObject
+    ) -> "Grid":
         self.cell_at(position).side(direction).remove(obj)
         return self
 
-    def objects_between(self, position: Position, direction: Direction | str
-                        ) -> tuple[PlaceObject, ...]:
+    def objects_between(
+        self, position: Position, direction: Direction | str
+    ) -> tuple[PlaceObject, ...]:
         return self.cell_at(position).side(direction).objects
 
     def _place_changed(self, place: Place):
@@ -535,23 +582,33 @@ class ClosedMaze(Grid):
         layer: int = 3
         blocks_movement: bool = True
 
-    def __init__(self, width: int, height: int, *, entrance: Position = (0, 0),
-                 exit: Position | None = None):
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        *,
+        entrance: Position = (0, 0),
+        exit: Position | None = None,
+    ):
         super().__init__(width, height, entrance=entrance, exit=exit)
         with self.batch():
             for location, _ in self.edge_places:
                 self.add_wall(location.position, location.direction)
 
     def has_wall(self, position: Position, direction: Direction | str) -> bool:
-        return any(isinstance(obj, self._Wall)
-                   for obj in self.objects_between(position, direction))
+        return any(
+            isinstance(obj, self._Wall)
+            for obj in self.objects_between(position, direction)
+        )
 
     def add_wall(self, position: Position, direction: Direction | str) -> "ClosedMaze":
         if not self.has_wall(position, direction):
             self.place_between(position, direction, self._Wall())
         return self
 
-    def remove_wall(self, position: Position, direction: Direction | str) -> "ClosedMaze":
+    def remove_wall(
+        self, position: Position, direction: Direction | str
+    ) -> "ClosedMaze":
         self.cell_at(position).side(direction).remove_where(
             lambda obj: isinstance(obj, self._Wall)
         )
@@ -562,8 +619,12 @@ class ClosedMaze(Grid):
         self.validate_position(b)
         ax, ay = a
         bx, by = b
-        direct = {(0, -1): Direction.UP, (1, 0): Direction.RIGHT,
-                  (0, 1): Direction.DOWN, (-1, 0): Direction.LEFT}.get((bx - ax, by - ay))
+        direct = {
+            (0, -1): Direction.UP,
+            (1, 0): Direction.RIGHT,
+            (0, 1): Direction.DOWN,
+            (-1, 0): Direction.LEFT,
+        }.get((bx - ax, by - ay))
         if direct is not None:
             return direct
         for direction in Direction:
@@ -584,18 +645,65 @@ class ClosedMaze(Grid):
         positions = list(positions)
         for position in positions:
             self.validate_position(position)
-        directions = [self._direction_between(a, b) for a, b in zip(positions, positions[1:])]
+        directions = [
+            self._direction_between(a, b) for a, b in zip(positions, positions[1:])
+        ]
         with self.batch():
             for position, direction in zip(positions, directions):
                 self.remove_wall(position, direction)
         return self
 
 
+class ClosedGrid(ClosedMaze):
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        *,
+        entrance: Position = (0, 0),
+        exit: Position | None = None,
+    ):
+        super().__init__(width, height, entrance=entrance, exit=exit)
+        path = []
+        path = []
+
+        # 1. Змейка по столбцам: чётные сверху вниз, нечётные снизу вверх
+        for i in range(width):
+            if i % 2 == 0:
+                for j in range(height):
+                    path.append((i, j))
+            else:
+                for j in range(height - 1, -1, -1):
+                    path.append((i, j))
+        self.open_path(path)
+
+        path = []
+
+        # 2. Змейка по строкам: начинаем с правого края (последний столбец)
+        #    и идём от последнего столбца к первому по строкам
+        for j in range(height):
+            if j % 2 == 0:
+                for i in range(width - 1, -1, -1):
+                    path.append((i, j))
+            else:
+                for i in range(width):
+                    path.append((i, j))
+
+        self.open_path(path)
+
+
 class RandomMaze(ClosedMaze):
     """Лабиринт с закрытыми краями, построенный DFS с заданным seed."""
 
-    def __init__(self, width: int, height: int, *, seed: int,
-                 entrance: Position = (0, 0), exit: Position | None = None):
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        *,
+        seed: int,
+        entrance: Position = (0, 0),
+        exit: Position | None = None,
+    ):
         if type(seed) is not int:
             raise ValueError("seed должен быть целым числом")
         super().__init__(width, height, entrance=entrance, exit=exit)
@@ -611,9 +719,11 @@ class RandomMaze(ClosedMaze):
                 for direction in Direction:
                     dx, dy = direction.delta
                     target = (x + dx, y + dy)
-                    if (0 <= target[0] < self.width
-                            and 0 <= target[1] < self.height
-                            and target not in visited):
+                    if (
+                        0 <= target[0] < self.width
+                        and 0 <= target[1] < self.height
+                        and target not in visited
+                    ):
                         candidates.append((direction, target))
                 if not candidates:
                     stack.pop()
@@ -728,8 +838,14 @@ class Mouse(Observable):
         self._direction = direction
 
     def _line(self, start: Position, direction: Direction) -> TrailLine:
-        common = dict(owner=self._trail_owner, sequence=self._sequence,
-                      start=start, end=self.position, direction=direction, ttl=1)
+        common = dict(
+            owner=self._trail_owner,
+            sequence=self._sequence,
+            start=start,
+            end=self.position,
+            direction=direction,
+            ttl=1,
+        )
         faded = TrailLine(**common, color="#dbeafe")
         fading = TrailLine(**common, color="#bfdbfe", next_object=faded)
         return TrailLine(**common, color="#93c5fd", next_object=fading)
@@ -743,8 +859,11 @@ class Mouse(Observable):
         self._trail = [self.position]
         self._direction = Direction.RIGHT
         for place in self._trail_places:
-            place.remove_where(lambda obj: isinstance(obj, TrailLine)
-                               and obj.owner is self._trail_owner)
+            place.remove_where(
+                lambda obj: (
+                    isinstance(obj, TrailLine) and obj.owner is self._trail_owner
+                )
+            )
         self._trail_places.clear()
 
 
@@ -762,8 +881,11 @@ class Game(Observable):
         super().__init__()
         if grid._game is not None:
             raise ValueError("Grid уже принадлежит другой игре")
-        if (isinstance(tick_delay, bool) or not isinstance(tick_delay, (int, float))
-                or tick_delay < 0):
+        if (
+            isinstance(tick_delay, bool)
+            or not isinstance(tick_delay, (int, float))
+            or tick_delay < 0
+        ):
             raise ValueError("tick_delay должен быть неотрицательным числом")
         self.grid = grid
         self.tick_delay = float(tick_delay)
@@ -777,7 +899,9 @@ class Game(Observable):
             with self.grid.batch(notify=False):
                 self._install_finish()
                 events = self._interact_destination(
-                    self.mouse.position, self.mouse.position, None,
+                    self.mouse.position,
+                    self.mouse.position,
+                    None,
                 )
             self._consume_events(events)
             grid._game = self
@@ -823,10 +947,15 @@ class Game(Observable):
                     self.grid._set_exit(position)
                     self.status = GameStatus.RUNNING
                     self._install_finish()
-                    events = (() if self.mouse.position != self.grid.exit else
-                              self._interact_destination(
-                                  self.mouse.position, self.mouse.position, None,
-                              ))
+                    events = (
+                        ()
+                        if self.mouse.position != self.grid.exit
+                        else self._interact_destination(
+                            self.mouse.position,
+                            self.mouse.position,
+                            None,
+                        )
+                    )
                 self._consume_events(events)
             finally:
                 self._notify_all(self.grid, self.mouse, self)
@@ -834,7 +963,9 @@ class Game(Observable):
         finally:
             self._acting = False
 
-    def subscribe_event(self, callback: Callable[[GameEvent], None]) -> Callable[[], None]:
+    def subscribe_event(
+        self, callback: Callable[[GameEvent], None]
+    ) -> Callable[[], None]:
         self._event_listeners.append(callback)
 
         def unsubscribe():
@@ -854,16 +985,31 @@ class Game(Observable):
         self._finish = None
         self._finish_place = None
 
-    def _context(self, place: Place, source: Position, target: Position,
-                 direction: Direction | None, phase: InteractionPhase) -> InteractionContext:
-        return InteractionContext(self, self.mouse, place, source, target, direction, phase)
+    def _context(
+        self,
+        place: Place,
+        source: Position,
+        target: Position,
+        direction: Direction | None,
+        phase: InteractionPhase,
+    ) -> InteractionContext:
+        return InteractionContext(
+            self, self.mouse, place, source, target, direction, phase
+        )
 
-    def _interact_destination(self, source: Position, target: Position,
-                              direction: Direction | None) -> tuple[GameEvent, ...]:
+    def _interact_destination(
+        self, source: Position, target: Position, direction: Direction | None
+    ) -> tuple[GameEvent, ...]:
         place = self.grid.cell_at(target).place
-        return place.interact(self._context(
-            place, source, target, direction, InteractionPhase.DESTINATION,
-        ))
+        return place.interact(
+            self._context(
+                place,
+                source,
+                target,
+                direction,
+                InteractionPhase.DESTINATION,
+            )
+        )
 
     def _consume_events(self, events: tuple[GameEvent, ...]):
         for event in events:
@@ -888,7 +1034,7 @@ class Game(Observable):
     def _step(self, direction: Direction) -> bool:
         self._ensure_idle()
         if self.finished:
-            return False
+            return
         source = self.mouse.position
         edge = self.mouse.cell.side(direction)
         if edge.closed:
@@ -899,7 +1045,7 @@ class Game(Observable):
                 self._publish((event,))
             finally:
                 self._acting = False
-            return False
+            return
         target = self.grid.adjacent(source, direction)
         self._acting = True
         changed = False
@@ -908,13 +1054,21 @@ class Game(Observable):
                 with self.grid.batch(notify=False):
                     self.grid.tick()
                     changed = True
-                    edge_events = edge.interact(self._context(
-                        edge, source, target, direction, InteractionPhase.EDGE,
-                    ))
+                    edge_events = edge.interact(
+                        self._context(
+                            edge,
+                            source,
+                            target,
+                            direction,
+                            InteractionPhase.EDGE,
+                        )
+                    )
                     self.mouse._move_to(self.grid.cell_at(target), direction)
                     try:
                         destination_events = self._interact_destination(
-                            source, target, direction,
+                            source,
+                            target,
+                            direction,
                         )
                     finally:
                         edge.install(self.mouse._line(source, direction))
@@ -929,7 +1083,7 @@ class Game(Observable):
             self._acting = False
         if self.tick_delay:
             sleep(self.tick_delay)
-        return True
+        return
 
     def _check(self, direction: Direction) -> bool:
         return self.grid.can_move(self.mouse.position, direction)
@@ -965,7 +1119,7 @@ class Game(Observable):
     def _turn(self, *, clockwise: bool) -> bool:
         self._ensure_idle()
         if self.finished:
-            return False
+            return
         direction = self._relative_direction(1 if clockwise else -1)
         self._acting = True
         try:
@@ -973,7 +1127,7 @@ class Game(Observable):
             self._notify_all(self.mouse, self)
         finally:
             self._acting = False
-        return True
+        return
 
     def turn_right(self) -> bool:
         return self._turn(clockwise=True)
@@ -1004,7 +1158,9 @@ class Game(Observable):
                     self.status = GameStatus.RUNNING
                     self._install_finish()
                     events = self._interact_destination(
-                        self.mouse.position, self.mouse.position, None,
+                        self.mouse.position,
+                        self.mouse.position,
+                        None,
                     )
                 self._consume_events(events)
             finally:
