@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import count
+from random import Random
 from time import sleep
 
 Position = tuple[int, int]
@@ -588,6 +589,39 @@ class ClosedMaze(Grid):
             for position, direction in zip(positions, directions):
                 self.remove_wall(position, direction)
         return self
+
+
+class RandomMaze(ClosedMaze):
+    """Лабиринт с закрытыми краями, построенный DFS с заданным seed."""
+
+    def __init__(self, width: int, height: int, *, seed: int,
+                 entrance: Position = (0, 0), exit: Position | None = None):
+        if type(seed) is not int:
+            raise ValueError("seed должен быть целым числом")
+        super().__init__(width, height, entrance=entrance, exit=exit)
+        self.seed = seed
+        random = Random(seed)
+        visited = {self.entrance}
+        stack = [self.entrance]
+        with self.batch():
+            while stack:
+                position = stack[-1]
+                candidates = []
+                x, y = position
+                for direction in Direction:
+                    dx, dy = direction.delta
+                    target = (x + dx, y + dy)
+                    if (0 <= target[0] < self.width
+                            and 0 <= target[1] < self.height
+                            and target not in visited):
+                        candidates.append((direction, target))
+                if not candidates:
+                    stack.pop()
+                    continue
+                direction, target = random.choice(candidates)
+                self.remove_wall(position, direction)
+                visited.add(target)
+                stack.append(target)
 
 
 class SpiralMaze(ClosedMaze):
