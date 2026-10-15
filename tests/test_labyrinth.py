@@ -277,7 +277,6 @@ class GameTests(unittest.TestCase):
         game = Game(Grid(3, 1))
         for name in ("move", "walk", "up", "right", "down", "left", "reset"):
             self.assertFalse(hasattr(game.mouse, name))
-        self.assertFalse(hasattr(game, "move"))
         self.assertFalse(hasattr(game, "walk"))
         with self.assertRaises(TypeError):
             game.right(2)
@@ -285,6 +284,24 @@ class GameTests(unittest.TestCase):
         self.assertEqual(game.mouse.position, (1, 0))
         with self.assertRaises(ValueError):
             Game(game.grid)
+
+    def test_turn_and_move_use_mouse_direction_without_moving_on_turn(self):
+        game = Game(Grid(3, 3))
+        observer = Mock()
+        game.subscribe(observer)
+
+        self.assertEqual(game.mouse.direction, Direction.RIGHT)
+        self.assertTrue(game.turn_right())
+        self.assertEqual(game.mouse.direction, Direction.DOWN)
+        self.assertEqual(game.mouse.position, (0, 0))
+        self.assertEqual(game.grid.current_tick, 0)
+        observer.assert_called_once_with()
+
+        self.assertTrue(game.move())
+        self.assertEqual(game.mouse.position, (0, 1))
+        self.assertEqual(game.mouse.direction, Direction.DOWN)
+        self.assertTrue(game.turn_left())
+        self.assertEqual(game.mouse.direction, Direction.RIGHT)
 
     def test_tick_delay_applies_only_after_successful_step(self):
         maze = ClosedMaze(3, 1, exit=(2, 0))
@@ -299,6 +316,27 @@ class GameTests(unittest.TestCase):
         for invalid in (-1, True, "1"):
             with self.assertRaises(ValueError):
                 Game(Grid(2, 1), tick_delay=invalid)
+
+    def test_direction_checks_do_not_move_or_trigger_wall_hit(self):
+        maze = ClosedMaze(2, 2)
+        maze.remove_wall((0, 0), "right")
+        maze.remove_wall((0, 0), "up")
+        game = Game(maze)
+        listener = Mock()
+        game.subscribe_event(listener)
+
+        self.assertTrue(game.check_up())
+        self.assertFalse(game.check_right())
+        self.assertFalse(game.check_down())
+        self.assertTrue(game.check_left())
+        self.assertTrue(game.check_forward())
+        game.turn_right()
+        self.assertFalse(game.check_forward())
+        self.assertFalse(game.check_right())
+        self.assertTrue(game.check_left())
+        self.assertEqual(game.mouse.position, (0, 0))
+        self.assertEqual(maze.current_tick, 0)
+        listener.assert_not_called()
 
     def test_blocked_or_finished_commands_return_false_without_tick(self):
         maze = ClosedMaze(2, 1)

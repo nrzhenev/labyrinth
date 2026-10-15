@@ -208,9 +208,7 @@ class MazeView:
         render_layer(3)
 
         x, y = self._center(self.mouse.position)
-        dx, dy = (1, 0)
-        if self.mouse.last_direction is not None:
-            dx, dy = self.mouse.last_direction.delta
+        dx, dy = self.mouse.direction.delta
 
         def point(forward, sideways):
             return (x + s * (forward * dx - sideways * dy),

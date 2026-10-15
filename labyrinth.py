@@ -689,7 +689,7 @@ class Mouse(Observable):
         self.grid = grid
         self._cell = grid.cell_at(grid.entrance)
         self._trail = [self.position]
-        self._last_direction: Direction | None = None
+        self._direction = Direction.RIGHT
         self._trail_owner = object()
         self._sequence = 0
         self._trail_places: set[Place] = set()
@@ -707,8 +707,12 @@ class Mouse(Observable):
         return tuple(self._trail)
 
     @property
-    def last_direction(self) -> Direction | None:
-        return self._last_direction
+    def direction(self) -> Direction:
+        return self._direction
+
+    @property
+    def last_direction(self) -> Direction:
+        return self._direction
 
     @property
     def at_exit(self) -> bool:
@@ -716,9 +720,12 @@ class Mouse(Observable):
 
     def _move_to(self, cell: Cell, direction: Direction):
         self._cell = cell
-        self._last_direction = direction
+        self._direction = direction
         self._trail.append(self.position)
         self._sequence += 1
+
+    def _turn_to(self, direction: Direction):
+        self._direction = direction
 
     def _line(self, start: Position, direction: Direction) -> TrailLine:
         common = dict(owner=self._trail_owner, sequence=self._sequence,
@@ -734,7 +741,7 @@ class Mouse(Observable):
     def _reset(self):
         self._cell = self.grid.cell_at(self.grid.entrance)
         self._trail = [self.position]
-        self._last_direction = None
+        self._direction = Direction.RIGHT
         for place in self._trail_places:
             place.remove_where(lambda obj: isinstance(obj, TrailLine)
                                and obj.owner is self._trail_owner)
@@ -923,6 +930,56 @@ class Game(Observable):
         if self.tick_delay:
             sleep(self.tick_delay)
         return True
+
+    def _check(self, direction: Direction) -> bool:
+        return self.grid.can_move(self.mouse.position, direction)
+
+    def _relative_direction(self, offset: int) -> Direction:
+        directions = tuple(Direction)
+        index = directions.index(self.mouse.direction)
+        return directions[(index + offset) % len(directions)]
+
+    def check_up(self) -> bool:
+        return self._check(Direction.UP)
+
+    def check_right(self) -> bool:
+        return self._check(self._relative_direction(1))
+
+    def check_down(self) -> bool:
+        return self._check(Direction.DOWN)
+
+    def check_left(self) -> bool:
+        return self._check(self._relative_direction(-1))
+
+    def check_forward(self) -> bool:
+        return self._check(self.mouse.direction)
+
+    def move(self) -> bool:
+        return {
+            Direction.UP: self.up,
+            Direction.RIGHT: self.right,
+            Direction.DOWN: self.down,
+            Direction.LEFT: self.left,
+        }[self.mouse.direction]()
+
+    def _turn(self, *, clockwise: bool) -> bool:
+        self._ensure_idle()
+        if self.finished:
+            return False
+        direction = self._relative_direction(1 if clockwise else -1)
+        self._acting = True
+        try:
+            self.mouse._turn_to(direction)
+            self._notify_all(self.mouse, self)
+        finally:
+            self._acting = False
+        return True
+
+    def turn_right(self) -> bool:
+        return self._turn(clockwise=True)
+
+    def turn_left(self) -> bool:
+        return self._turn(clockwise=False)
 
     def up(self) -> bool:
         return self._step(Direction.UP)
